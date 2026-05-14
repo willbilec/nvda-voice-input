@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+*.pyo
+.tmpreq/
+dist/package/
+tests/silence.wav

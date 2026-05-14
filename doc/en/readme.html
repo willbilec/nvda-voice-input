@@ -1,0 +1,25 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Groq Voice Dictation</title>
+</head>
+<body>
+<h1>Groq Voice Dictation</h1>
+<p>Groq Voice Dictation adds push-to-toggle voice dictation to NVDA.</p>
+<h2>Usage</h2>
+<ul>
+<li>Press <strong>NVDA+Shift+V</strong> to start recording.</li>
+<li>Press the same gesture again to stop and send the recording.</li>
+<li>If silence detection is enabled, recording stops automatically after the configured quiet period.</li>
+</ul>
+<h2>Settings</h2>
+<p>Open NVDA Settings and choose <strong>Groq Voice Dictation</strong> to configure your Groq API key, default microphone, cleanup mode, silence detection, feedback, and paste fallback.</p>
+<p>The settings panel includes a <strong>Get API key</strong> button that first shows setup instructions in a standard dialog and then opens the Groq keys page. Use NVDA's installed add-ons dialog for the add-on documentation/help entry.</p>
+<h2>Notes</h2>
+<ul>
+<li>The add-on does not ship with an API key.</li>
+<li>Audio is recorded locally, sent to Groq for transcription, optionally cleaned up with a second Groq request, and then inserted into the focused control.</li>
+</ul>
+</body>
+</html>
