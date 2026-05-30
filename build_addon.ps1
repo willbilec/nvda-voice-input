@@ -3,8 +3,8 @@ $ErrorActionPreference = "Stop"
 $root = Split-Path -Parent $MyInvocation.MyCommand.Path
 $dist = Join-Path $root "dist"
 $staging = Join-Path $dist "package"
-$output = Join-Path $dist "groqVoiceDictation-0.1.0.nvda-addon"
-$zipOutput = Join-Path $dist "groqVoiceDictation-0.1.0.zip"
+$output = Join-Path $dist "groqVoiceDictation-0.2.0.nvda-addon"
+$zipOutput = Join-Path $dist "groqVoiceDictation-0.2.0.zip"
 
 if (Test-Path $staging) {
 	Remove-Item -Recurse -Force $staging

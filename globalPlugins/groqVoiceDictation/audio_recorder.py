@@ -37,6 +37,7 @@ class AudioRecorder:
 		self._silence_duration = 0.0
 		self._silence_notified = False
 		self._recording = False
+		self._speech_detected = False
 
 	def start(self) -> None:
 		if self._recording:
@@ -44,6 +45,7 @@ class AudioRecorder:
 		self._frames = []
 		self._silence_duration = 0.0
 		self._silence_notified = False
+		self._speech_detected = False
 		try:
 			self._pa = pyaudio.PyAudio()
 			self._stream = self._pa.open(
@@ -89,10 +91,12 @@ class AudioRecorder:
 			if peak <= self._silence_threshold:
 				self._silence_duration += duration
 			else:
+				self._speech_detected = True
 				self._silence_duration = 0.0
 				self._silence_notified = False
 			if (
-				not self._silence_notified
+				self._speech_detected
+				and not self._silence_notified
 				and self._silence_duration >= self._silence_timeout
 				and self._on_silence is not None
 			):

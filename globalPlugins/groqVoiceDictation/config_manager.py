@@ -35,7 +35,7 @@ CONFSPEC = {
 	"silenceTimeout": "integer(default=2,min=1,max=15)",
 	"feedbackMode": 'string(default="both")',
 	"allowPasteFallback": "boolean(default=true)",
-	"silenceThreshold": "integer(default=500,min=100,max=5000)",
+	"silenceThreshold": "integer(default=1500,min=100,max=32767)",
 }
 
 

@@ -1,4 +1,5 @@
 from typing import Any
+import threading
 import webbrowser
 
 import addonHandler
@@ -9,7 +10,7 @@ from logHandler import log
 import ui
 import wx
 
-from .audio_recorder import list_input_devices
+from .audio_recorder import AudioRecorder, calculate_peak_level, list_input_devices
 from . import config_manager
 
 try:
@@ -116,10 +117,15 @@ class GroqVoiceDictationSettingsPanel(SettingsPanel):
 			nvdaControls.SelectOnFocusSpinCtrl,
 			value=str(conf["silenceThreshold"]),
 			min=100,
-			max=5000,
+			max=32767,
+		)
+
+		self.sample_mic_button = sizer_helper.addItem(
+			wx.Button(self, label=_("Sa&mple microphone level"))
 		)
 
 		self.Bind(wx.EVT_BUTTON, self.on_get_api_key, self.get_api_key_button)
+		self.Bind(wx.EVT_BUTTON, self.on_sample_mic, self.sample_mic_button)
 		self.addon_help_note = sizer_helper.addItem(
 			wx.StaticText(
 				self,
@@ -135,6 +141,69 @@ class GroqVoiceDictationSettingsPanel(SettingsPanel):
 			if device_index == saved_index:
 				return selection
 		return 0
+
+	def on_sample_mic(self, _event) -> None:
+		self.sample_mic_button.Disable()
+		self.sample_mic_button.SetLabel(_("Sampling..."))
+		device_index = self._microphone_choices[self.microphone_device.GetSelection()][0]
+		threading.Thread(target=self._do_sample_mic, args=(device_index,), daemon=True).start()
+
+	def _do_sample_mic(self, device_index: int) -> None:
+		import pyaudio
+		peak = 0
+		try:
+			pa = pyaudio.PyAudio()
+			try:
+				stream = pa.open(
+					format=pyaudio.paInt16,
+					channels=AudioRecorder.channels,
+					rate=AudioRecorder.rate,
+					input=True,
+					input_device_index=None if device_index < 0 else device_index,
+					frames_per_buffer=AudioRecorder.chunk_size,
+				)
+				chunks = int(AudioRecorder.rate / AudioRecorder.chunk_size)  # ~1 second
+				for _ in range(chunks):
+					data = stream.read(AudioRecorder.chunk_size, exception_on_overflow=False)
+					chunk_peak = calculate_peak_level(data)
+					if chunk_peak > peak:
+						peak = chunk_peak
+				stream.stop_stream()
+				stream.close()
+			finally:
+				pa.terminate()
+			wx.CallAfter(self._show_sample_result, peak, None)
+		except Exception as exc:
+			wx.CallAfter(self._show_sample_result, 0, str(exc))
+
+	def _show_sample_result(self, peak: int, error: str | None) -> None:
+		self.sample_mic_button.SetLabel(_("Sa&mple microphone level"))
+		self.sample_mic_button.Enable()
+		if error:
+			wx.MessageBox(
+				_("Could not sample microphone: {}").format(error),
+				_("Microphone sample"),
+				wx.OK | wx.ICON_ERROR,
+				self,
+			)
+			return
+		suggestion = min(peak + 200, 32767)
+		message = _(
+			"Peak level during silence: {peak}\n\n"
+			"Set your Silence threshold above this value so that "
+			"quiet moments are detected correctly.\n\n"
+			"Suggested threshold: {suggestion}"
+		).format(peak=peak, suggestion=suggestion)
+		dlg = wx.MessageDialog(
+			self,
+			message,
+			_("Microphone sample"),
+			wx.YES_NO | wx.ICON_INFORMATION,
+		)
+		dlg.SetYesNoLabels(_("Set threshold to {}").format(suggestion), _("Close"))
+		if dlg.ShowModal() == wx.ID_YES:
+			self.silence_threshold.SetValue(suggestion)
+		dlg.Destroy()
 
 	def on_get_api_key(self, _event) -> None:
 		message = _(
