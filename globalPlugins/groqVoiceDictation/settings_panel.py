@@ -112,6 +112,24 @@ class GroqVoiceDictationSettingsPanel(SettingsPanel):
 		)
 		self.allow_paste_fallback.SetValue(conf["allowPasteFallback"])
 
+		self.readback_mode = sizer_helper.addLabeledControl(
+			_("&Read-back mode:"),
+			wx.Choice,
+			choices=config_manager.label_list(config_manager.READBACK_MODES),
+		)
+		self.readback_mode.SetSelection(
+			config_manager.index_for_value(config_manager.READBACK_MODES, conf["readbackMode"])
+		)
+
+		self.confirm_timeout = sizer_helper.addLabeledControl(
+			_("Confirm &timeout (seconds):"),
+			nvdaControls.SelectOnFocusSpinCtrl,
+			value=str(conf["confirmTimeout"]),
+			min=2,
+			max=15,
+		)
+		self.confirm_timeout.Enable(conf["readbackMode"] == "confirm")
+
 		self.silence_threshold = sizer_helper.addLabeledControl(
 			_("Silence &threshold:"),
 			nvdaControls.SelectOnFocusSpinCtrl,
@@ -126,6 +144,7 @@ class GroqVoiceDictationSettingsPanel(SettingsPanel):
 
 		self.Bind(wx.EVT_BUTTON, self.on_get_api_key, self.get_api_key_button)
 		self.Bind(wx.EVT_BUTTON, self.on_sample_mic, self.sample_mic_button)
+		self.Bind(wx.EVT_CHOICE, self.on_readback_mode_change, self.readback_mode)
 		self.addon_help_note = sizer_helper.addItem(
 			wx.StaticText(
 				self,
@@ -205,6 +224,10 @@ class GroqVoiceDictationSettingsPanel(SettingsPanel):
 			self.silence_threshold.SetValue(suggestion)
 		dlg.Destroy()
 
+	def on_readback_mode_change(self, _event) -> None:
+		mode = config_manager.READBACK_MODES[self.readback_mode.GetSelection()][0]
+		self.confirm_timeout.Enable(mode == "confirm")
+
 	def on_get_api_key(self, _event) -> None:
 		message = _(
 			"To get a Groq API key:\n\n"
@@ -235,5 +258,7 @@ class GroqVoiceDictationSettingsPanel(SettingsPanel):
 			"feedbackMode": config_manager.FEEDBACK_MODES[self.feedback_mode.GetSelection()][0],
 			"allowPasteFallback": self.allow_paste_fallback.GetValue(),
 			"silenceThreshold": self.silence_threshold.GetValue(),
+			"readbackMode": config_manager.READBACK_MODES[self.readback_mode.GetSelection()][0],
+			"confirmTimeout": self.confirm_timeout.GetValue(),
 		}
 		config_manager.update_base_profile(values)
