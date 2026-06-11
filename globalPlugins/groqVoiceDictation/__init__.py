@@ -44,6 +44,9 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
 		self._processing = False
 		self._text_inserter = TextInserter()
 		self._state_lock = threading.Lock()
+		self._pending_text: str | None = None
+		self._confirm_timer: wx.CallLater | None = None
+		self._confirm_gestures_bound: bool = False
 
 	def terminate(self):
 		with self._state_lock:
@@ -160,6 +163,49 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
 			AudioRecorder.delete_file(wav_path)
 			with self._state_lock:
 				self._processing = False
+
+	def _clear_confirm_gestures(self) -> None:
+		if not self._confirm_gestures_bound:
+			return
+		self._confirm_gestures_bound = False
+		self.removeGestureBinding("kb:space")
+		self.removeGestureBinding("kb:escape")
+		if self._confirm_timer is not None:
+			self._confirm_timer.Stop()
+			self._confirm_timer = None
+
+	def _start_confirm_window(self, text: str) -> None:
+		conf = config_manager.get()
+		self._pending_text = text
+		ui.message(text)
+		self.bindGesture("kb:space", "cancelPendingDictation")
+		self.bindGesture("kb:escape", "cancelPendingDictation")
+		self._confirm_gestures_bound = True
+		self._confirm_timer = wx.CallLater(conf["confirmTimeout"] * 1000, self._execute_pending_insert)
+
+	def script_cancelPendingDictation(self, gesture) -> None:
+		self._clear_confirm_gestures()
+		self._pending_text = None
+		with self._state_lock:
+			self._processing = False
+		self._notify(_("Dictation cancelled."))
+
+	def _execute_pending_insert(self) -> None:
+		self._clear_confirm_gestures()
+		text = self._pending_text
+		self._pending_text = None
+		conf = config_manager.get()
+		inserted = self._text_inserter.insert(text, conf["allowPasteFallback"])
+		with self._state_lock:
+			self._processing = False
+		if inserted:
+			self._notify(_("Dictation inserted."), tone=980)
+		else:
+			self._notify(
+				_("Could not insert the dictated text into the current control."),
+				tone=220,
+				is_error=True,
+			)
 
 	def _notify(self, message: str, tone: int = 440, is_error: bool = False) -> None:
 		mode = config_manager.get()["feedbackMode"]
