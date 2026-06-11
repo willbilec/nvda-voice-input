@@ -11,11 +11,14 @@ TRANSCRIPTION_MODELS = [
 CLEANUP_MODELS = [
 	"llama-3.1-8b-instant",
 	"llama-3.3-70b-versatile",
+	"meta-llama/llama-4-scout-17b-16e-instruct",
+	"qwen/qwen3-32b",
 ]
 
 CLEANUP_MODES = [
 	("raw", "Raw transcript"),
 	("light", "Light cleanup"),
+	("moderate", "Moderate cleanup"),
 	("heavy", "Heavy rewrite"),
 ]
 
@@ -23,6 +26,12 @@ FEEDBACK_MODES = [
 	("speech", "Speech only"),
 	("tones", "Tones only"),
 	("both", "Speech and tones"),
+]
+
+READBACK_MODES = [
+	("off", "Off"),
+	("after", "Read back after insertion"),
+	("confirm", "Read back and confirm before insertion"),
 ]
 
 CONFSPEC = {
@@ -36,6 +45,8 @@ CONFSPEC = {
 	"feedbackMode": 'string(default="both")',
 	"allowPasteFallback": "boolean(default=true)",
 	"silenceThreshold": "integer(default=1500,min=100,max=32767)",
+	"readbackMode": 'string(default="off")',
+	"confirmTimeout": "integer(default=5,min=2,max=15)",
 }
 
 
