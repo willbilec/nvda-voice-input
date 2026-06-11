@@ -49,6 +49,8 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
 		self._confirm_gestures_bound: bool = False
 
 	def terminate(self):
+		self._clear_confirm_gestures()
+		self._pending_text = None
 		with self._state_lock:
 			recorder = self._recorder
 			self._recorder = None
@@ -131,6 +133,7 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
 	def _process_recording(self, wav_path: str) -> None:
 		conf = config_manager.get()
 		client = GroqClient(api_key=conf["apiKey"])
+		_confirm_pending = False
 		try:
 			self._notify(_("Transcribing."), tone=520)
 			transcript = client.transcribe(wav_path, conf["transcriptionModel"])
@@ -148,11 +151,22 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
 			if not final_text.strip():
 				self._notify(_("The cleanup step returned empty text."), tone=260, is_error=True)
 				return
-			inserted = self._text_inserter.insert(final_text, conf["allowPasteFallback"])
-			if inserted:
-				self._notify(_("Dictation inserted."), tone=980)
+			readback_mode = conf["readbackMode"]
+			if readback_mode == "confirm":
+				_confirm_pending = True
+				wx.CallAfter(self._start_confirm_window, final_text)
 			else:
-				self._notify(_("Could not insert the dictated text into the current control."), tone=220, is_error=True)
+				inserted = self._text_inserter.insert(final_text, conf["allowPasteFallback"])
+				if inserted:
+					self._notify(_("Dictation inserted."), tone=980)
+					if readback_mode == "after":
+						wx.CallAfter(ui.message, final_text)
+				else:
+					self._notify(
+						_("Could not insert the dictated text into the current control."),
+						tone=220,
+						is_error=True,
+					)
 		except GroqClientError as exc:
 			log.error("Groq dictation failed: %s (%s)", exc.message, exc.category)
 			self._notify(exc.message, tone=220, is_error=True)
@@ -161,8 +175,9 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
 			self._notify(_("Unexpected dictation error. Check the NVDA log for details."), tone=220, is_error=True)
 		finally:
 			AudioRecorder.delete_file(wav_path)
-			with self._state_lock:
-				self._processing = False
+			if not _confirm_pending:
+				with self._state_lock:
+					self._processing = False
 
 	def _clear_confirm_gestures(self) -> None:
 		if not self._confirm_gestures_bound:
