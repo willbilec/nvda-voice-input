@@ -6,6 +6,7 @@ import time
 import api
 import core
 from keyboardHandler import KeyboardInputGesture
+from logHandler import log
 import watchdog
 
 
@@ -14,6 +15,7 @@ KEYEVENTF_KEYUP = 0x0002
 KEYEVENTF_UNICODE = 0x0004
 WM_COMMAND = 0x0111
 CONSOLE_PASTE = 0xFFF1
+SENDINPUT_BATCH = 50
 
 
 class KEYBDINPUT(ctypes.Structure):
@@ -52,22 +54,33 @@ class TextInserter:
 	def _type_unicode(self, text: str) -> bool:
 		utf16_units = array.array("H")
 		utf16_units.frombytes(text.encode("utf-16-le"))
-		inputs = []
-		for unit in utf16_units:
-			inputs.append(INPUT(type=INPUT_KEYBOARD, union=_INPUTUNION(ki=KEYBDINPUT(0, unit, KEYEVENTF_UNICODE, 0, None))))
-			inputs.append(INPUT(type=INPUT_KEYBOARD, union=_INPUTUNION(ki=KEYBDINPUT(0, unit, KEYEVENTF_UNICODE | KEYEVENTF_KEYUP, 0, None))))
-		if not inputs:
+		if not utf16_units:
 			return False
-		count = ctypes.windll.user32.SendInput(len(inputs), (INPUT * len(inputs))(*inputs), ctypes.sizeof(INPUT))
-		return count == len(inputs)
+		for i in range(0, len(utf16_units), SENDINPUT_BATCH):
+			chunk = utf16_units[i : i + SENDINPUT_BATCH]
+			inputs = []
+			for unit in chunk:
+				inputs.append(INPUT(type=INPUT_KEYBOARD, union=_INPUTUNION(ki=KEYBDINPUT(0, unit, KEYEVENTF_UNICODE, 0, None))))
+				inputs.append(INPUT(type=INPUT_KEYBOARD, union=_INPUTUNION(ki=KEYBDINPUT(0, unit, KEYEVENTF_UNICODE | KEYEVENTF_KEYUP, 0, None))))
+			count = ctypes.windll.user32.SendInput(len(inputs), (INPUT * len(inputs))(*inputs), ctypes.sizeof(INPUT))
+			if count != len(inputs):
+				log.debug("SendInput returned %s of %s inputs", count, len(inputs))
+				return False
+			time.sleep(0.005)
+		return True
 
 	def _paste_text(self, text: str, focus) -> bool:
+		for attempt in range(3):
+			if api.copyToClip(text):
+				break
+			time.sleep(0.1)
+		else:
+			log.debug("copyToClip failed after 3 attempts")
+			return False
 		try:
 			clipboard_backup = api.getClipData()
 		except OSError:
 			clipboard_backup = None
-		if not api.copyToClip(text):
-			return False
 		time.sleep(0.05)
 		api.processPendingEvents(False)
 		if focus and getattr(focus, "windowClassName", "") == "ConsoleWindowClass":

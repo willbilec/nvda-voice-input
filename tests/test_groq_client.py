@@ -15,8 +15,9 @@ if "config" not in sys.modules:
 if "logHandler" not in sys.modules:
 	sys.modules["logHandler"] = types.SimpleNamespace(log=types.SimpleNamespace(error=lambda *args, **kwargs: None))
 
-from groq_client import build_cleanup_messages, map_http_error, normalize_api_key
+from groq_client import build_cleanup_messages, map_http_error, normalize_api_key, strip_thinking_tags, is_hallucination
 import config_manager
+from config_manager import load_prompt_slots, get_active_prompt
 
 
 class GroqClientHelpersTests(unittest.TestCase):
@@ -27,7 +28,8 @@ class GroqClientHelpersTests(unittest.TestCase):
 
 	def test_heavy_cleanup_uses_rewrite_prompt(self):
 		messages = build_cleanup_messages("draft", "heavy")
-		self.assertIn("rewrite", messages[0]["content"].lower())
+		self.assertIn("transform", messages[0]["content"].lower())
+		self.assertIn("restructure", messages[0]["content"].lower())
 
 	def test_normalize_api_key_removes_whitespace(self):
 		self.assertEqual(
@@ -39,6 +41,68 @@ class GroqClientHelpersTests(unittest.TestCase):
 		error = map_http_error(403, '{"error":{"message":"Forbidden"}}')
 		self.assertEqual(error.category, "auth")
 		self.assertEqual(error.message, "Forbidden")
+
+
+class StripThinkingTagsTests(unittest.TestCase):
+	def test_strips_think_tags(self):
+		result = strip_thinking_tags(
+			"<think>internal reasoning</think> cleaned text"
+		)
+		self.assertEqual(result, "cleaned text")
+
+	def test_strips_thinking_tags(self):
+		result = strip_thinking_tags(
+			"<thinking>some reasoning</thinking> final output"
+		)
+		self.assertEqual(result, "final output")
+
+	def test_strips_thought_tags(self):
+		result = strip_thinking_tags(
+			"<thought>reflection</thought> result"
+		)
+		self.assertEqual(result, "result")
+
+	def test_strips_multiline_thinking(self):
+		result = strip_thinking_tags(
+			"<think>\nreasoning line 1\nreasoning line 2\n</think>\n\nthe actual text"
+		)
+		self.assertEqual(result, "the actual text")
+
+	def test_no_thinking_tags_passes_through(self):
+		result = strip_thinking_tags("plain text without any tags")
+		self.assertEqual(result, "plain text without any tags")
+
+	def test_empty_after_stripping_returns_empty(self):
+		result = strip_thinking_tags("<think>only thinking</think>")
+		self.assertEqual(result, "")
+
+	def test_whitespace_after_stripping_is_preserved(self):
+		result = strip_thinking_tags(
+			"<think>x</think>  content  "
+		)
+		self.assertEqual(result, "content")
+
+
+class IsHallucinationTests(unittest.TestCase):
+	def test_thank_you_is_hallucination(self):
+		self.assertTrue(is_hallucination("thank you"))
+		self.assertTrue(is_hallucination("Thank You"))
+		self.assertTrue(is_hallucination("  thank you  "))
+
+	def test_thanks_for_watching_is_hallucination(self):
+		self.assertTrue(is_hallucination("thanks for watching"))
+
+	def test_normal_text_is_not_hallucination(self):
+		self.assertFalse(is_hallucination("this issue needs to be fixed"))
+		self.assertFalse(is_hallucination("hello world"))
+		self.assertFalse(is_hallucination("please help with this bug"))
+
+	def test_empty_is_hallucination(self):
+		self.assertTrue(is_hallucination(""))
+		self.assertTrue(is_hallucination("  "))
+
+	def test_period_is_hallucination(self):
+		self.assertTrue(is_hallucination("."))
 
 
 class ConfigManagerTests(unittest.TestCase):
@@ -55,6 +119,199 @@ class ConfigManagerTests(unittest.TestCase):
 		self.assertEqual(live_section["cleanupMode"], "light")
 		self.assertEqual(base_section["apiKey"], "abc")
 		self.assertEqual(base_section["cleanupMode"], "light")
+
+
+class CleanupPromptRulesTests(unittest.TestCase):
+	"""Lock in the anti-cutoff and anti-hallucination rules added to the prompts."""
+
+	def test_all_modes_preserve_opening_words(self):
+		for mode in ("light", "moderate", "heavy"):
+			messages = build_cleanup_messages("anything goes", mode)
+			content = messages[0]["content"]
+			self.assertTrue(
+				"PRESERVE THE FIRST WORD" in content or "PRESERVE OPENING WORDS" in content,
+				msg=f"mode {mode!r} missing opening-word preservation rule",
+			)
+
+	def test_all_modes_clarify_false_start(self):
+		for mode in ("light", "moderate", "heavy"):
+			messages = build_cleanup_messages("anything goes", mode)
+			self.assertIn(
+				"NOT a false start",
+				messages[0]["content"],
+				msg=f"mode {mode!r} missing false-start clarification",
+			)
+
+	def test_light_and_moderate_forbid_adding_words(self):
+		for mode in ("light", "moderate"):
+			messages = build_cleanup_messages("anything goes", mode)
+			content = messages[0]["content"]
+			self.assertIn("Do NOT add any word", content)
+
+	def test_light_forbids_inventing_preceding_word(self):
+		messages = build_cleanup_messages("anything goes", "light")
+		self.assertIn("Do NOT invent a preceding word", messages[0]["content"])
+
+	def test_heavy_keeps_rewrite_keywords(self):
+		messages = build_cleanup_messages("draft", "heavy")
+		content = messages[0]["content"].lower()
+		self.assertIn("transform", content)
+		self.assertIn("restructure", content)
+		self.assertIn("prefer words the speaker actually used", messages[0]["content"])
+
+	def test_moderate_preserves_opening_words_every_sentence(self):
+		messages = build_cleanup_messages("anything goes", "moderate")
+		content = messages[0]["content"]
+		self.assertIn("PRESERVE OPENING WORDS", content)
+		self.assertIn("every sentence", content.lower())
+
+	def test_moderate_forbids_pronoun_changes(self):
+		messages = build_cleanup_messages("anything goes", "moderate")
+		content = messages[0]["content"]
+		self.assertIn("Do NOT change pronouns", content)
+
+	def test_moderate_forbids_replacement(self):
+		messages = build_cleanup_messages("anything goes", "moderate")
+		self.assertIn("Do NOT replace any word with a different word", messages[0]["content"])
+
+	def test_moderate_forbids_rephrasing(self):
+		messages = build_cleanup_messages("anything goes", "moderate")
+		self.assertIn("Do NOT rephrase", messages[0]["content"])
+
+	def test_moderate_openers_include_yes_and_for_example(self):
+		messages = build_cleanup_messages("anything goes", "moderate")
+		content = messages[0]["content"]
+		self.assertIn("'Yes'", content)
+		self.assertIn("'For example'", content)
+
+	def test_moderate_does_not_license_pronoun_clarity(self):
+		messages = build_cleanup_messages("anything goes", "moderate")
+		self.assertNotIn("pronoun clarity", messages[0]["content"].lower())
+
+	def test_moderate_does_not_license_smoothing(self):
+		messages = build_cleanup_messages("anything goes", "moderate")
+		self.assertNotIn("smooth awkward", messages[0]["content"].lower())
+
+	def test_all_modes_preserve_hedges(self):
+		for mode in ("light", "moderate", "heavy"):
+			messages = build_cleanup_messages("anything goes", mode)
+			content = messages[0]["content"].lower()
+			self.assertIn("hedges", content, msg=f"mode {mode!r} missing hedge preservation")
+			self.assertIn("maybe", content, msg=f"mode {mode!r} hedge list missing 'maybe'")
+
+	def test_all_modes_preserve_slang(self):
+		for mode in ("light", "moderate", "heavy"):
+			messages = build_cleanup_messages("anything goes", mode)
+			content = messages[0]["content"].lower()
+			self.assertIn("slang", content, msg=f"mode {mode!r} missing slang preservation")
+			self.assertIn("fubar", content, msg=f"mode {mode!r} missing fubar example")
+
+	def test_all_modes_forbid_answering_questions(self):
+		for mode in ("light", "moderate", "heavy"):
+			messages = build_cleanup_messages("anything goes", mode)
+			content = messages[0]["content"].lower()
+			self.assertIn("do not answer questions", content, msg=f"mode {mode!r} missing no-answer rule")
+			self.assertIn("editor", content, msg=f"mode {mode!r} missing editor role framing")
+
+	def test_all_modes_have_certainty_rule(self):
+		for mode in ("light", "moderate", "heavy"):
+			messages = build_cleanup_messages("anything goes", mode)
+			content = messages[0]["content"]
+			self.assertIn("CERTAINTY", content, msg=f"mode {mode!r} missing certainty rule")
+			self.assertIn("RESPONSIBILITY", content)
+			self.assertIn("EMOTION", content)
+
+	def test_all_modes_protect_short_utterances(self):
+		for mode in ("light", "moderate", "heavy"):
+			messages = build_cleanup_messages("anything goes", mode)
+			content = messages[0]["content"].lower()
+			self.assertIn("short", content, msg=f"mode {mode!r} missing short-utterance rule")
+			self.assertIn("under 8 words", content, msg=f"mode {mode!r} missing under-8-words threshold")
+
+	def test_moderate_warns_about_paraphrase_creep(self):
+		messages = build_cleanup_messages("anything goes", "moderate")
+		content = messages[0]["content"]
+		self.assertIn("PARAPHRASE CREEP", content)
+
+	def test_heavy_fixes_asr_mishearings(self):
+		messages = build_cleanup_messages("anything goes", "heavy")
+		content = messages[0]["content"]
+		self.assertIn("ASR mishearings", content)
+		self.assertIn("TensorFlow", content)
+
+	def test_moderate_does_not_fix_asr_mishearings(self):
+		messages = build_cleanup_messages("anything goes", "moderate")
+		self.assertNotIn("ASR mishearings", messages[0]["content"])
+
+	def test_light_does_not_fix_asr_mishearings(self):
+		messages = build_cleanup_messages("anything goes", "light")
+		self.assertNotIn("ASR mishearings", messages[0]["content"])
+
+	def test_heavy_forbids_pronoun_swaps(self):
+		messages = build_cleanup_messages("anything goes", "heavy")
+		self.assertIn("Do NOT change pronouns", messages[0]["content"])
+
+	def test_speak_raw_transcript_in_confspec(self):
+		self.assertIn("speakRawTranscript", config_manager.CONFSPEC)
+		self.assertIn("boolean", config_manager.CONFSPEC["speakRawTranscript"])
+
+
+class PromptSlotTests(unittest.TestCase):
+	def test_load_prompt_slots_returns_defaults(self):
+		slots = load_prompt_slots({})
+		self.assertEqual(len(slots), config_manager.PROMPT_SLOT_COUNT)
+		self.assertIn("NVDA", slots[0])
+		self.assertIn("dictation", slots[1])
+		self.assertIn("Python", slots[2])
+		self.assertEqual(slots[9], "")
+
+	def test_load_prompt_slots_from_json_string(self):
+		custom = ["custom one", "custom two"]
+		raw = json.dumps(custom)
+		conf = {"promptSlots": raw}
+		slots = load_prompt_slots(conf)
+		self.assertEqual(slots[0], "custom one")
+		self.assertEqual(slots[1], "custom two")
+		self.assertEqual(len(slots), config_manager.PROMPT_SLOT_COUNT)
+
+	def test_load_prompt_slots_from_list(self):
+		custom = ["slot a", "slot b"]
+		conf = {"promptSlots": custom}
+		slots = load_prompt_slots(conf)
+		self.assertEqual(slots[0], "slot a")
+		self.assertEqual(slots[1], "slot b")
+
+	def test_load_prompt_slots_truncates_excess(self):
+		too_many = [f"slot {i}" for i in range(20)]
+		conf = {"promptSlots": json.dumps(too_many)}
+		slots = load_prompt_slots(conf)
+		self.assertEqual(len(slots), config_manager.PROMPT_SLOT_COUNT)
+
+	def test_load_prompt_slots_handles_invalid_json(self):
+		conf = {"promptSlots": "not valid json[[["}
+		slots = load_prompt_slots(conf)
+		self.assertEqual(len(slots), config_manager.PROMPT_SLOT_COUNT)
+		self.assertIn("NVDA", slots[0])
+
+	def test_get_active_prompt_returns_slot_zero(self):
+		slots = ["first", "second"]
+		conf = {"promptSlots": json.dumps(slots), "activePromptSlot": 0}
+		self.assertEqual(get_active_prompt(conf), "first")
+
+	def test_get_active_prompt_returns_slot_one(self):
+		slots = ["first", "second"]
+		conf = {"promptSlots": json.dumps(slots), "activePromptSlot": 1}
+		self.assertEqual(get_active_prompt(conf), "second")
+
+	def test_get_active_prompt_out_of_range_returns_empty(self):
+		slots = ["first", "second"]
+		conf = {"promptSlots": json.dumps(slots), "activePromptSlot": 99}
+		self.assertEqual(get_active_prompt(conf), "")
+
+	def test_prompt_slots_in_confspec(self):
+		self.assertIn("promptSlots", config_manager.CONFSPEC)
+		self.assertIn("activePromptSlot", config_manager.CONFSPEC)
+
 
 
 if __name__ == "__main__":

@@ -4,3 +4,10 @@ __pycache__/
 .tmpreq/
 dist/package/
 tests/silence.wav
+dist/*.nvda-addon
+
+# Tool directories
+.codegraph/
+.graymatter/
+.opencode/
+.claude/
