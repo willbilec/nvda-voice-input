@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.5.0 (2026-07-04)
+
+### Fixed
+- **Cleanup model selection not sticking in settings dialog.** `CleanupDialog._on_model_change` called `self.GetSizer().Layout()`, but `CleanupDialog` is a `wx.Dialog` (not a `SettingsPanel`) and has no sizer of its own, so `GetSizer()` returned `None` and `.Layout()` threw `AttributeError: 'NoneType' object has no attribute 'Layout'` on every model change. The exception left the dialog's event loop in a confused state, causing subsequent OK clicks to intermittently fail to persist the new value to `nvda.ini`. Changed to `self.Layout()` with a comment explaining why. Symptom: users trying to switch the cleanup model from Gemini to Groq (or vice versa) sometimes found the change reverted after restarting NVDA.
+
+### Added
+- Three regression tests in `CleanupDialogRegressionTests` that assert the buggy `self.GetSizer().Layout()` cannot be reintroduced and that the rationale comment is preserved.
+
 ## v0.4.0 (2026-07-03)
 
 ### Added

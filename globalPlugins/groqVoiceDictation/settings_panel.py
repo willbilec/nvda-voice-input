@@ -404,7 +404,11 @@ class CleanupDialog(wx.Dialog):
 		if 0 <= sel < len(self._model_values):
 			model = self._model_values[sel]
 			self._llama_warning.Show(model in config_manager.LLAMA_MODELS)
-			self.GetSizer().Layout()
+			# CleanupDialog is a wx.Dialog — it has no sizer of its own
+			# (the sizer lives on the inner panel). Calling self.GetSizer()
+			# returns None and crashes. self.Layout() re-lays out the
+			# dialog's children instead.
+			self.Layout()
 
 
 class FeedbackDialog(wx.Dialog):

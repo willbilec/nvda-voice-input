@@ -14,7 +14,7 @@ An NVDA add-on for push-to-toggle voice dictation using Groq Whisper transcripti
 
 ## Known issues
 
-- **Gemini cleanup is experimental / work in progress.** The expanded cleanup prompts improve quality but may be slow or error on long transcripts (>10 seconds of speech). If you encounter issues with Gemini, switch to a Groq cleanup model via the Settings dialog.
+- **Gemini cleanup has a tight free-tier quota.** The `gemini-3.5-flash` model is limited to 20 requests per day on Google's free tier (HTTP 429 with "Quota exceeded for metric: ...free_tier_requests, limit: 20"). If you hit the limit, switch to a Groq cleanup model via the Settings dialog, or use `gemini-2.5-flash-lite` which has a 1,000 RPD free-tier allowance. The addon's fallback inserts the raw transcript when the cleanup API fails so dictation never silently drops.
 - The fallback microphone feature auto-switches if the primary mic produces silence during the preflight period
 
 ## Architecture
