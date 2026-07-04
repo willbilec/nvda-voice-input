@@ -313,6 +313,53 @@ class PromptSlotTests(unittest.TestCase):
 		self.assertIn("activePromptSlot", config_manager.CONFSPEC)
 
 
+class CleanupDialogRegressionTests(unittest.TestCase):
+	"""Regression tests for the settings-panel bug that caused the cleanup
+	model choice not to stick. CleanupDialog is a wx.Dialog (not a
+	SettingsPanel), so self.GetSizer() returns None and crashed with
+	AttributeError on every model change, leaving the dialog in a state
+	where OK clicks did not always save the new value. Fix: call
+	self.Layout() (which re-lays out the dialog's children) instead.
+	"""
+
+	@classmethod
+	def setUpClass(cls) -> None:
+		cls._settings_panel_path = (
+			ROOT / "globalPlugins" / "groqVoiceDictation" / "settings_panel.py"
+		)
+		cls._source = cls._settings_panel_path.read_text(encoding="utf-8")
+
+	def test_on_model_change_does_not_call_getsizer(self):
+		# The bug: CleanupDialog has no sizer of its own, so
+		# self.GetSizer() returns None and .Layout() crashes with
+		# AttributeError. The handler must not use GetSizer().Layout().
+		self.assertNotIn(
+			"self.GetSizer().Layout()",
+			self._source,
+			msg="CleanupDialog._on_model_change must not call self.GetSizer().Layout() "
+			"because wx.Dialog has no sizer of its own — this crashes with "
+			"AttributeError and prevents the model choice from being saved.",
+		)
+
+	def test_on_model_change_uses_layout(self):
+		# The fix: call self.Layout() (re-lays out dialog children) instead.
+		self.assertIn(
+			"self.Layout()",
+			self._source,
+			msg="CleanupDialog._on_model_change should call self.Layout() to re-lay out "
+			"the dialog after the llama-warning visibility changes.",
+		)
+
+	def test_on_model_change_mentions_cleanup_dialog_in_comment(self):
+		# The comment near the fix should explain *why* the change is needed,
+		# so the next maintainer doesn't revert it back to GetSizer().Layout().
+		self.assertIn(
+			"CleanupDialog is a wx.Dialog",
+			self._source,
+			msg="Add a comment near self.Layout() explaining that CleanupDialog is a "
+			"wx.Dialog and has no sizer of its own.",
+		)
+
 
 if __name__ == "__main__":
 	unittest.main()
