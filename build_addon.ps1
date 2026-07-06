@@ -3,8 +3,19 @@ $ErrorActionPreference = "Stop"
 $root = Split-Path -Parent $MyInvocation.MyCommand.Path
 $dist = Join-Path $root "dist"
 $staging = Join-Path $dist "package"
-$output = Join-Path $dist "groqVoiceDictation-0.5.0.nvda-addon"
-$zipOutput = Join-Path $dist "groqVoiceDictation-0.5.0.zip"
+# Read the addon version from manifest.ini so we don't have to keep this
+# script in sync when the version is bumped.
+$manifestPath = Join-Path $root "manifest.ini"
+$versionLine = Get-Content $manifestPath | Where-Object { $_ -match '^version\s*=' } | Select-Object -First 1
+if ($null -eq $versionLine) {
+	throw "Could not find 'version = ...' line in manifest.ini"
+}
+$version = ($versionLine -split '=', 2)[1].Trim()
+if ($version -notmatch '^\d+(\.\d+)*$') {
+	throw "manifest.ini version '$version' is not a plain dotted version (e.g. 0.6.0)"
+}
+$output = Join-Path $dist "groqVoiceDictation-$version.nvda-addon"
+$zipOutput = Join-Path $dist "groqVoiceDictation-$version.zip"
 
 if (Test-Path $staging) {
 	Remove-Item -Recurse -Force $staging

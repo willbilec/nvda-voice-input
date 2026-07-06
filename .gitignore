@@ -11,3 +11,5 @@ dist/*.nvda-addon
 .graymatter/
 .opencode/
 .claude/
+.hermes/
+.tmp_inspect_zip*.py
