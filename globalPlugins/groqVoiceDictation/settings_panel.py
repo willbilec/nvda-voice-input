@@ -23,6 +23,36 @@ _addon = addonHandler.getCodeAddon()
 ADDON_SUMMARY = _addon.manifest["summary"]
 
 
+def ensure_device_in_choices(choices: list, device_index: int, label: str | None = None) -> bool:
+	"""Add a saved device to a microphone choice list if it is missing.
+
+	``list_input_devices`` filters out devices on host APIs it does not
+	trust (MME, "Microsoft Sound Mapper", generic "Input", etc.), and
+	devices that fail to enumerate on a particular run. If the user's
+	saved device index is filtered out, the dialog cannot show it as the
+	current selection — MicrophoneDialog._index_for_device returns 0 for
+	missing entries, which silently shows "System default" as selected.
+	Clicking OK then overwrites the user's saved device index with -1.
+
+	This helper appends the saved index as an explicit entry so the
+	dialog can show it as the active selection. Returns True if an entry
+	was added, False otherwise (so the caller can log or count).
+	"""
+	if device_index < 0:
+		return False
+	if any(idx == device_index for idx, _ in choices):
+		return False
+	if label is None:
+		label = _("Saved microphone (device %d, not currently detected)") % device_index
+	log.warning(
+		"Saved microphone device %d is not in the enumerated device list; "
+		"adding it to the dialog choices so the user's selection is preserved.",
+		device_index,
+	)
+	choices.append((device_index, label))
+	return True
+
+
 class APIKeyDialog(wx.Dialog):
 	def __init__(self, parent: wx.Window, groq_key: str = "", gemini_key: str = "") -> None:
 		super().__init__(parent, title=_("Manage API Keys"), size=(520, 320))
@@ -331,10 +361,110 @@ class SilenceDialog(wx.Dialog):
 		dlg.Destroy()
 
 
+class AudioDialog(wx.Dialog):
+	"""Settings for the audio-processing pipeline.
+
+	The knobs exposed here are independent of the silence-detection
+	settings (which live in ``SilenceDialog``) so the user can tune
+	"how is the WAV trimmed before it goes to Whisper" separately
+	from "when does the recorder auto-stop". Both pipelines share
+	the same ``silenceThreshold`` because the trim uses the same
+	voice/no-voice boundary as the silence detector.
+	"""
+
+	def __init__(self, parent: wx.Window, pre_roll_ms: int, pre_trim_ms: int,
+			trailing_trim_ms: int, auto_retry: bool) -> None:
+		super().__init__(parent, title=_("Audio Processing"), size=(480, 360))
+		panel = wx.Panel(self)
+		sizer = wx.BoxSizer(wx.VERTICAL)
+		helper = guiHelper.BoxSizerHelper(panel, sizer=sizer)
+
+		intro = wx.StaticText(panel, label=_(
+			"Fine-tune how the recorded audio is prepared for the "
+			"Whisper transcription API. Defaults are tuned for "
+			"typical desktop microphones."
+		))
+		intro.Wrap(440)
+		helper.addItem(intro)
+
+		self.pre_roll_ms = helper.addLabeledControl(
+			_("Pre-roll &warm-up (ms):"), nvdaControls.SelectOnFocusSpinCtrl,
+			value=str(pre_roll_ms), min=0, max=2000,
+		)
+		helper.addItem(wx.StaticText(panel, label=_(
+			"0 disables pre-roll. 300-500ms helps capture the first "
+			"phoneme on slow microphones (AirPods, USB headsets) at "
+			"the cost of a small delay before the 'Listening' tone."
+		))).Wrap(440)
+
+		self.pre_trim_ms = helper.addLabeledControl(
+			_("&Leading silence to keep (ms):"), nvdaControls.SelectOnFocusSpinCtrl,
+			value=str(pre_trim_ms), min=0, max=2000,
+		)
+		helper.addItem(wx.StaticText(panel, label=_(
+			"Trims long silence before the first word, but keeps "
+			"this much as a buffer so Whisper has acoustic context. "
+			"0 disables the trim."
+		))).Wrap(440)
+
+		self.trailing_trim_ms = helper.addLabeledControl(
+			_("&Trailing silence to keep (ms):"), nvdaControls.SelectOnFocusSpinCtrl,
+			value=str(trailing_trim_ms), min=0, max=2000,
+		)
+		helper.addItem(wx.StaticText(panel, label=_(
+			"Trims silence after the last word, but keeps this "
+			"much as a buffer. 0 disables the trim."
+		))).Wrap(440)
+
+		self.auto_retry = helper.addItem(
+			wx.CheckBox(panel, label=_("&Auto-retry when first transcription looks suspicious"))
+		)
+		self.auto_retry.SetValue(auto_retry)
+		helper.addItem(wx.StaticText(panel, label=_(
+			"Retries without the prompt when the first pass returns "
+			"a short result starting with a common opener. Recovers "
+			"from the 'prompt-induced start-skipping' failure mode. "
+			"Off skips the second API call but loses that recovery."
+		))).Wrap(440)
+
+		helper.addItem(wx.Button(panel, wx.ID_OK, label=_("OK")))
+
+	@property
+	def pre_roll(self) -> int:
+		return int(self.pre_roll_ms.GetValue())
+
+	@property
+	def pre_trim(self) -> int:
+		return int(self.pre_trim_ms.GetValue())
+
+	@property
+	def trailing_trim(self) -> int:
+		return int(self.trailing_trim_ms.GetValue())
+
+	@property
+	def auto_retry_enabled(self) -> bool:
+		return self.auto_retry.GetValue()
+
+
 class CleanupDialog(wx.Dialog):
+	# Reasoning effort choices shown in the dialog. Mirrors the
+	# `reasoning_effort` parameter on Groq's GPT-OSS chat models.
+	# Other models (Llama, Gemini) ignore the parameter, so the
+	# dropdown is hidden for them in _on_model_change.
+	REASONING_EFFORT_CHOICES: list[tuple[str, str]] = [
+		("low", "Low (fastest)"),
+		("medium", "Medium (balanced)"),
+		("high", "High (most thorough)"),
+	]
+	REASONING_EFFORT_VALUES = [v for v, _ in REASONING_EFFORT_CHOICES]
+	REASONING_EFFORT_DISPLAY = [label for _, label in REASONING_EFFORT_CHOICES]
+	# Model id prefixes that honor `reasoning_effort`. Add to this set
+	# when a new reasoning-capable model is onboarded.
+	REASONING_CAPABLE_PREFIXES: tuple[str, ...] = ("openai/gpt-oss",)
+
 	def __init__(self, parent: wx.Window, mode: str, model: str,
-			gemini_key: str) -> None:
-		super().__init__(parent, title=_("Cleanup"), size=(520, 250))
+			gemini_key: str, reasoning_effort: str = "low") -> None:
+		super().__init__(parent, title=_("Cleanup"), size=(520, 320))
 		panel = wx.Panel(self)
 		sizer = wx.BoxSizer(wx.VERTICAL)
 		helper = guiHelper.BoxSizerHelper(panel, sizer=sizer)
@@ -358,11 +488,30 @@ class CleanupDialog(wx.Dialog):
 			wx.StaticText(panel, label=_("Note: Llama models are deprecated and may be removed from Groq in the near future."))
 		)
 		self._llama_warning.SetForegroundColour(wx.Colour(180, 80, 0))
-		self._llama_warning.Show(model in config_manager.LLAMA_MODELS)
+
+		# Reasoning-effort dropdown. Only enabled for models that
+		# honor the parameter (currently gpt-oss). Hidden otherwise
+		# to keep the dialog uncluttered.
+		self.reasoning_effort = helper.addLabeledControl(
+			_("Reasoning &effort:"), wx.Choice,
+			choices=self.REASONING_EFFORT_DISPLAY,
+		)
+		effort_index = 0
+		if reasoning_effort in self.REASONING_EFFORT_VALUES:
+			effort_index = self.REASONING_EFFORT_VALUES.index(reasoning_effort)
+		self.reasoning_effort.SetSelection(effort_index)
+		self._reasoning_effort_note = helper.addItem(wx.StaticText(panel, label=_(
+			"Higher = more model thinking, slower cleanup. Low is the "
+			"recommended default and is enough for the rule-bound "
+			"cleanup prompt. Bump to medium or high only if low "
+			"misses a case."
+		)))
+		self._reasoning_effort_note.Wrap(440)
 
 		self.cleanup_model.Bind(wx.EVT_CHOICE, self._on_model_change)
-
 		helper.addItem(wx.Button(panel, wx.ID_OK, label=_("OK")))
+		# Set the initial visibility for the saved model selection.
+		self._on_model_change(None)
 
 	@staticmethod
 	def _build_model_choices(gemini_key: str) -> tuple[list[str], list[str]]:
@@ -389,6 +538,13 @@ class CleanupDialog(wx.Dialog):
 			return self._model_values[sel]
 		return ""
 
+	@property
+	def reasoning_effort_value(self) -> str:
+		sel = self.reasoning_effort.GetSelection()
+		if 0 <= sel < len(self.REASONING_EFFORT_VALUES):
+			return self.REASONING_EFFORT_VALUES[sel]
+		return "low"
+
 	def _set_model_selection(self, model: str) -> None:
 		try:
 			idx = self._model_values.index(model)
@@ -399,16 +555,29 @@ class CleanupDialog(wx.Dialog):
 		elif self.cleanup_model.GetCount() > 0:
 			self.cleanup_model.SetSelection(0)
 
+	def _is_reasoning_capable(self, model: str) -> bool:
+		return any(model.startswith(p) for p in self.REASONING_CAPABLE_PREFIXES)
+
 	def _on_model_change(self, _event) -> None:
 		sel = self.cleanup_model.GetSelection()
 		if 0 <= sel < len(self._model_values):
 			model = self._model_values[sel]
-			self._llama_warning.Show(model in config_manager.LLAMA_MODELS)
-			# CleanupDialog is a wx.Dialog — it has no sizer of its own
-			# (the sizer lives on the inner panel). Calling self.GetSizer()
-			# returns None and crashes. self.Layout() re-lays out the
-			# dialog's children instead.
-			self.Layout()
+		else:
+			model = ""
+		self._llama_warning.Show(model in config_manager.LLAMA_MODELS)
+		# Show the reasoning-effort controls only when the selected
+		# model actually honors the parameter. Other models ignore
+		# it, so showing the dropdown would just be a UI lie.
+		capable = self._is_reasoning_capable(model)
+		self.reasoning_effort.Show(capable)
+		note = getattr(self, "_reasoning_effort_note", None)
+		if note is not None:
+			note.Show(capable)
+		# CleanupDialog is a wx.Dialog — it has no sizer of its own
+		# (the sizer lives on the inner panel). Calling self.GetSizer()
+		# returns None and crashes. self.Layout() re-lays out the
+		# dialog's children instead.
+		self.Layout()
 
 
 class FeedbackDialog(wx.Dialog):
@@ -512,6 +681,7 @@ class GroqVoiceDictationSettingsPanel(SettingsPanel):
 		self._silence_threshold = conf["silenceThreshold"]
 		self._cleanup_mode = conf["cleanupMode"]
 		self._cleanup_model = conf["cleanupModel"]
+		self._cleanup_reasoning_effort = conf.get("cleanupReasoningEffort", "low")
 		self._feedback_mode = conf["feedbackMode"]
 		self._readback_mode = conf["readbackMode"]
 		self._confirm_timeout = conf["confirmTimeout"]
@@ -523,6 +693,27 @@ class GroqVoiceDictationSettingsPanel(SettingsPanel):
 			self._microphone_choices.extend(list_input_devices())
 		except Exception:
 			log.exception("Could not list microphone devices")
+		# The user's saved microphones may not appear in the enumerated list
+		# if they are on a host API that list_input_devices filters out (MME,
+		# "Microsoft Sound Mapper", generic "Input", etc.), or if a device
+		# was unplugged between sessions. Without this guard, opening the
+		# microphone dialog would silently show "System default" as selected
+		# (because _index_for_device returns 0 for missing entries), and
+		# clicking OK would overwrite the user's saved device index with -1.
+		# Inject the saved values as explicit entries so the dialog can show
+		# them as the active selection.
+		ensure_device_in_choices(self._microphone_choices, self._mic_device)
+		ensure_device_in_choices(self._microphone_choices, self._fallback_mic_device)
+
+		# Audio-processing knobs live in their own config keys; the
+		# dedicated AudioDialog edits them. Read the current values
+		# once so the dialog opens with the right state.
+		from . import config_manager as _cm
+		audio_cfg = _cm.get_audio_processing(conf)
+		self._pre_roll_ms = audio_cfg["preRollMs"]
+		self._pre_trim_ms = audio_cfg["preTrimSilenceMs"]
+		self._trailing_trim_ms = audio_cfg["trailingTrimSilenceMs"]
+		self._auto_retry = audio_cfg["autoRetryEnabled"]
 
 		sizer_helper.addItem(
 			wx.StaticText(self, label=_("Click a category below to manage settings:"))
@@ -539,6 +730,9 @@ class GroqVoiceDictationSettingsPanel(SettingsPanel):
 		)
 		self._silence_btn = sizer_helper.addItem(
 			wx.Button(self, label=_("Silence Detection..."))
+		)
+		self._audio_btn = sizer_helper.addItem(
+			wx.Button(self, label=_("Audio Processing..."))
 		)
 		self._cleanup_btn = sizer_helper.addItem(
 			wx.Button(self, label=_("Cleanup..."))
@@ -559,6 +753,7 @@ class GroqVoiceDictationSettingsPanel(SettingsPanel):
 		self._transcription_btn.Bind(wx.EVT_BUTTON, self._on_transcription)
 		self._microphone_btn.Bind(wx.EVT_BUTTON, self._on_microphone)
 		self._silence_btn.Bind(wx.EVT_BUTTON, self._on_silence)
+		self._audio_btn.Bind(wx.EVT_BUTTON, self._on_audio)
 		self._cleanup_btn.Bind(wx.EVT_BUTTON, self._on_cleanup)
 		self._feedback_btn.Bind(wx.EVT_BUTTON, self._on_feedback)
 		self._debug_btn.Bind(wx.EVT_BUTTON, self._on_debug)
@@ -617,15 +812,31 @@ class GroqVoiceDictationSettingsPanel(SettingsPanel):
 			self._fallback_preflight = dlg.preflight
 		dlg.Destroy()
 
+	def _on_audio(self, _event) -> None:
+		dlg = AudioDialog(self,
+			pre_roll_ms=self._pre_roll_ms,
+			pre_trim_ms=self._pre_trim_ms,
+			trailing_trim_ms=self._trailing_trim_ms,
+			auto_retry=self._auto_retry,
+		)
+		if dlg.ShowModal() == wx.ID_OK:
+			self._pre_roll_ms = dlg.pre_roll
+			self._pre_trim_ms = dlg.pre_trim
+			self._trailing_trim_ms = dlg.trailing_trim
+			self._auto_retry = dlg.auto_retry_enabled
+		dlg.Destroy()
+
 	def _on_cleanup(self, _event) -> None:
 		dlg = CleanupDialog(self,
 			mode=self._cleanup_mode,
 			model=self._cleanup_model,
 			gemini_key=self._gemini_key,
+			reasoning_effort=self._cleanup_reasoning_effort,
 		)
 		if dlg.ShowModal() == wx.ID_OK:
 			self._cleanup_mode = dlg.mode
 			self._cleanup_model = dlg.model
+			self._cleanup_reasoning_effort = dlg.reasoning_effort_value
 		dlg.Destroy()
 
 	def _on_feedback(self, _event) -> None:
@@ -661,6 +872,7 @@ class GroqVoiceDictationSettingsPanel(SettingsPanel):
 			"activePromptSlot": self._active_prompt_slot,
 			"cleanupMode": self._cleanup_mode,
 			"cleanupModel": self._cleanup_model,
+			"cleanupReasoningEffort": self._cleanup_reasoning_effort,
 			"microphoneDevice": self._mic_device,
 			"fallbackMicrophoneDevice": self._fallback_mic_device,
 			"fallbackEnabled": self._fallback_enabled,
@@ -673,5 +885,9 @@ class GroqVoiceDictationSettingsPanel(SettingsPanel):
 			"readbackMode": self._readback_mode,
 			"confirmTimeout": self._confirm_timeout,
 			"speakRawTranscript": self._speak_raw,
+			"preRollMs": self._pre_roll_ms,
+			"preTrimSilenceMs": self._pre_trim_ms,
+			"trailingTrimSilenceMs": self._trailing_trim_ms,
+			"autoRetryEnabled": self._auto_retry,
 		}
 		config_manager.update_base_profile(values)
