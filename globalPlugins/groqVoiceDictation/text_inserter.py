@@ -15,7 +15,10 @@ KEYEVENTF_KEYUP = 0x0002
 KEYEVENTF_UNICODE = 0x0004
 WM_COMMAND = 0x0111
 CONSOLE_PASTE = 0xFFF1
-SENDINPUT_BATCH = 50
+# SendInput queues the array atomically. Larger batches substantially reduce
+# Python/Win32 crossings for long dictations without approaching Windows'
+# practical input-array limits.
+SENDINPUT_BATCH = 256
 
 
 class KEYBDINPUT(ctypes.Structure):
@@ -66,10 +69,20 @@ class TextInserter:
 			if count != len(inputs):
 				log.debug("SendInput returned %s of %s inputs", count, len(inputs))
 				return False
-			time.sleep(0.005)
 		return True
 
 	def _paste_text(self, text: str, focus) -> bool:
+		# Back up the user's clipboard BEFORE we overwrite it with the
+		# dictation text. The old order (copy first, then read) meant
+		# the backup captured the dictation text itself, so the
+		# "restore" put the dictation text back on the clipboard
+		# instead of the user's original content. Symptom: the last
+		# dictation stayed on the clipboard after a paste-fallback
+		# insertion.
+		try:
+			clipboard_backup = api.getClipData()
+		except OSError:
+			clipboard_backup = None
 		for attempt in range(3):
 			if api.copyToClip(text):
 				break
@@ -77,11 +90,8 @@ class TextInserter:
 		else:
 			log.debug("copyToClip failed after 3 attempts")
 			return False
-		try:
-			clipboard_backup = api.getClipData()
-		except OSError:
-			clipboard_backup = None
-		time.sleep(0.05)
+		# copyToClip is synchronous; pumping NVDA's pending events is enough
+		# before issuing paste. The old fixed 50ms wait delayed every fallback.
 		api.processPendingEvents(False)
 		if focus and getattr(focus, "windowClassName", "") == "ConsoleWindowClass":
 			watchdog.cancellableSendMessage(focus.windowHandle, WM_COMMAND, CONSOLE_PASTE, 0)

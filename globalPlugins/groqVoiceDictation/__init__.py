@@ -20,7 +20,7 @@ from scriptHandler import script
 
 from . import config_manager
 from .audio_recorder import AudioRecorder, AudioRecorderError
-from .groq_client import GroqClient, GroqClientError, is_hallucination
+from .groq_client import GroqClient, GroqClientError
 from .gemini_client import GeminiClient, GeminiClientError
 from .settings_panel import GroqVoiceDictationSettingsPanel
 from .text_inserter import TextInserter
@@ -35,6 +35,13 @@ _addon = addonHandler.getCodeAddon()
 ADDON_SUMMARY = _addon.manifest["summary"]
 
 
+def _warm_groq_connection(api_key: str) -> None:
+	# Use a separate Session from the recording worker. Both sessions mount
+	# GroqClient's shared thread-safe HTTPS pool, so the warmed connection is
+	# reused without ever accessing one requests.Session from two threads.
+	GroqClient(api_key=api_key).warm_connection()
+
+
 class GlobalPlugin(globalPluginHandler.GlobalPlugin):
 	scriptCategory = ADDON_SUMMARY
 
@@ -43,6 +50,7 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
 		config_manager.ensure_config_spec()
 		gui.settingsDialogs.NVDASettingsDialog.categoryClasses.append(GroqVoiceDictationSettingsPanel)
 		self._recorder = None
+		self._recording_client: GroqClient | None = None
 		self._processing = False
 		self._text_inserter = TextInserter()
 		self._state_lock = threading.Lock()
@@ -69,6 +77,7 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
 		with self._state_lock:
 			recorder = self._recorder
 			self._recorder = None
+			self._recording_client = None
 		if recorder is not None and recorder.is_recording:
 			try:
 				wav_path = recorder.stop()
@@ -127,6 +136,7 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
 			return
 		fallback_enabled = conf["fallbackEnabled"]
 		audio_cfg = config_manager.get_audio_processing(conf)
+		network_client = GroqClient(api_key=conf["apiKey"])
 		recorder = AudioRecorder(
 			on_silence=self._handle_silence_stop,
 			on_pre_roll_complete=self._handle_pre_roll_complete,
@@ -146,6 +156,14 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
 			return
 		with self._state_lock:
 			self._recorder = recorder
+			self._recording_client = network_client
+		# Hide DNS/TCP/TLS setup behind the recording time. The warm-up is
+		# best-effort and never delays microphone readiness or error reporting.
+		threading.Thread(
+			target=_warm_groq_connection,
+			args=(conf["apiKey"],),
+			daemon=True,
+		).start()
 		if recorder.used_fallback:
 			self._notify(_("Listening (using fallback microphone.)"), tone=880)
 		else:
@@ -197,6 +215,10 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
 	def _start_fallback_recording(self) -> None:
 		conf = config_manager.get()
 		audio_cfg = config_manager.get_audio_processing(conf)
+		with self._state_lock:
+			network_client = getattr(self, "_recording_client", None)
+		if network_client is None:
+			network_client = GroqClient(api_key=conf["apiKey"])
 		recorder = AudioRecorder(
 			on_silence=self._handle_silence_stop,
 			on_pre_roll_complete=self._handle_pre_roll_complete,
@@ -216,6 +238,12 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
 			return
 		with self._state_lock:
 			self._recorder = recorder
+			self._recording_client = network_client
+		threading.Thread(
+			target=_warm_groq_connection,
+			args=(conf["apiKey"],),
+			daemon=True,
+		).start()
 		# Mirror the main path: if pre-roll is on, the "Listening"
 		# tone is deferred to _handle_pre_roll_complete.
 		if audio_cfg["preRollMs"] <= 0:
@@ -256,6 +284,7 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
 			self._processing = False
 			recorder = self._recorder
 			self._recorder = None
+			self._recording_client = None
 		self._pending_text = None
 		if recorder is not None and recorder.is_recording:
 			try:
@@ -274,7 +303,9 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
 			recorder = self._recorder
 			if recorder is None or not recorder.is_recording:
 				return
+			network_client = getattr(self, "_recording_client", None)
 			self._recorder = None
+			self._recording_client = None
 			self._processing = True
 		try:
 			has_speech = recorder.has_speech()
@@ -295,13 +326,26 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
 				self._processing = False
 			self._notify(_("Could not stop the recorder."), tone=220, is_error=True)
 			return
+		if network_client is None:
+			network_client = GroqClient(api_key=config_manager.get()["apiKey"])
 		stop_message = _("Silence detected. Processing.") if auto_stop else _("Stopped listening. Processing.")
 		self._notify(stop_message, tone=660)
-		threading.Thread(target=self._process_recording, args=(wav_path, has_speech, recorder.used_fallback), daemon=True).start()
+		threading.Thread(
+			target=self._process_recording,
+			args=(wav_path, has_speech, recorder.used_fallback, network_client),
+			daemon=True,
+		).start()
 
-	def _process_recording(self, wav_path: str, has_speech: bool, used_fallback: bool) -> None:
+	def _process_recording(
+		self,
+		wav_path: str,
+		has_speech: bool,
+		used_fallback: bool,
+		transcription_client: GroqClient | None = None,
+	) -> None:
 		conf = config_manager.get()
-		transcription_client = GroqClient(api_key=conf["apiKey"])
+		if transcription_client is None:
+			transcription_client = GroqClient(api_key=conf["apiKey"])
 		transcription_model = conf["transcriptionModel"]
 		transcription_prompt = config_manager.get_active_prompt(conf)
 		_confirm_pending = False
@@ -343,7 +387,10 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
 			if self._is_cancelled(my_token):
 				log.info("Dictation worker bailing out: cancelled after transcribe")
 				return
-			if not transcript.strip() or is_hallucination(transcript):
+			# The recorder has already confirmed physical speech. Do not discard a
+			# literal short utterance such as "thank you" merely because it also
+			# appears on a generic Whisper-hallucination phrase list.
+			if not transcript.strip():
 				self._notify(_("No speech was detected."), tone=260, is_error=True)
 				return
 			log.info("Raw transcript: %r", transcript)
@@ -359,7 +406,9 @@ class GlobalPlugin(globalPluginHandler.GlobalPlugin):
 					if gk:
 						cleanup_client = GeminiClient(api_key=gk)
 				else:
-					cleanup_client = GroqClient(api_key=conf["apiKey"])
+					# Reuse the transcription session so cleanup avoids a second
+					# DNS/TCP/TLS handshake on the critical path.
+					cleanup_client = transcription_client
 				if cleanup_client is None:
 					self._notify(_("Gemini key not set. Inserting raw transcript."), tone=420, is_error=True)
 					final_text = transcript

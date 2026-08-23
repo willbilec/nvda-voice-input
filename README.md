@@ -12,6 +12,24 @@ Groq Voice Dictation is an NVDA add-on that provides push-to-toggle voice dictat
 - Typing-first text insertion with paste fallback
 - Guided API key setup from the settings panel
 
+## Accuracy and response time
+
+The default recognizer is Whisper Large V3, Groq's recommended model for
+error-sensitive transcription. Whisper Large V3 Turbo remains available when
+lower cost and slightly lower latency matter more than the lowest word-error
+rate. Selecting the spoken language avoids language-detection mistakes.
+
+New configurations start with an empty Whisper prompt because a prompt biases
+the recognizer; select one of the focused glossary slots only when its terms
+match the current dictation. Raw transcript mode makes one model request. AI
+cleanup uses deterministic generation and rejects a result that changes the
+opening, pronouns, negation, modality, certainty, or too many lexical words,
+falling back to Whisper's raw text instead of guessing missing speech.
+
+The add-on records mono WAV audio and trims leading/trailing silence before upload.
+It also opens the Groq connection while you are speaking so connection setup is
+normally finished before you press Stop.
+
 ## Build
 
 Run:

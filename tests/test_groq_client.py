@@ -35,20 +35,26 @@ from groq_client import (
 	_looks_suspicious,
 	_filter_hallucinated_segments,
 	build_cleanup_messages,
+	cleanup_preserves_meaning,
 	is_hallucination,
 	map_http_error,
 	normalize_api_key,
 	strip_thinking_tags,
 )
+import groq_client as groq_client_module
 import importlib
-# Make sure the plugin package is loaded so gemini_client's relative
-# import resolves. Drop any cached copies so we get a clean import.
-for _n in (PLUGIN_PKG, PACKAGE_PARENT.name):
-	sys.modules.pop(_n, None)
+# Create a lightweight package shell so gemini_client's relative import works
+# without executing the NVDA GlobalPlugin entry point (addonHandler and wx are
+# intentionally unavailable in the normal unit-test interpreter).
+if "globalPlugins" not in sys.modules:
+	global_plugins_pkg = types.ModuleType("globalPlugins")
+	global_plugins_pkg.__path__ = [str(PACKAGE_PARENT)]
+	sys.modules["globalPlugins"] = global_plugins_pkg
+plugin_pkg = types.ModuleType(PLUGIN_PKG)
+plugin_pkg.__path__ = [str(MODULE_DIR)]
+sys.modules[PLUGIN_PKG] = plugin_pkg
 sys.modules.pop("globalPlugins.groqVoiceDictation.gemini_client", None)
 sys.modules.pop("globalPlugins.groqVoiceDictation.groq_client", None)
-import globalPlugins  # noqa: F401
-import globalPlugins.groqVoiceDictation  # noqa: F401
 gemini_client = importlib.import_module(f"{PLUGIN_PKG}.gemini_client")
 import config_manager
 from config_manager import (
@@ -79,6 +85,86 @@ class GroqClientHelpersTests(unittest.TestCase):
 		error = map_http_error(403, '{"error":{"message":"Forbidden"}}')
 		self.assertEqual(error.category, "auth")
 		self.assertEqual(error.message, "Forbidden")
+
+	def test_cleanup_prompts_stay_compact(self):
+		# Input tokens directly affect time to first token. Keep every mode
+		# comfortably below the former 449/942/506-word prompts.
+		for mode in ("light", "moderate", "heavy"):
+			words = build_cleanup_messages("sample", mode)[0]["content"].split()
+			self.assertLess(len(words), 250, msg=f"{mode} prompt regressed to {len(words)} words")
+
+	def test_clients_share_https_connection_pool(self):
+		first = GroqClient(api_key="one")
+		second = GroqClient(api_key="two")
+		self.assertIs(
+			first._session.adapters["https://"],
+			second._session.adapters["https://"],
+		)
+
+	def test_connection_warmup_uses_models_endpoint(self):
+		client = GroqClient(api_key="key")
+		response = mock.MagicMock()
+		with mock.patch.object(groq_client_module, "_network_was_recently_active", return_value=False), \
+				mock.patch.object(client._session, "get", return_value=response) as get_mock:
+			self.assertTrue(client.warm_connection())
+		get_mock.assert_called_once_with(groq_client_module.MODELS_URL, timeout=(3, 5))
+		response.close.assert_called_once()
+
+
+class CleanupFidelityTests(unittest.TestCase):
+	"""Text-only cleanup must never be trusted to reconstruct missing speech."""
+
+	def assertRejected(self, original: str, cleaned: str, mode: str = "moderate") -> None:
+		accepted, _reason = cleanup_preserves_meaning(original, cleaned, mode)
+		self.assertFalse(accepted)
+
+	def assertAccepted(self, original: str, cleaned: str, mode: str = "moderate") -> None:
+		accepted, reason = cleanup_preserves_meaning(original, cleaned, mode)
+		self.assertTrue(accepted, msg=reason)
+
+	def test_rejects_command_changed_into_first_person_intention(self):
+		self.assertRejected("Do some research.", "I should do some research.")
+
+	def test_rejects_first_person_intention_changed_into_command(self):
+		self.assertRejected("I should do some research.", "Do some research.")
+
+	def test_rejects_pronoun_swap(self):
+		self.assertRejected(
+			"You can update the program after all the tests finish successfully.",
+			"We can update the program after all the tests finish successfully.",
+		)
+
+	def test_rejects_negation_change(self):
+		self.assertRejected(
+			"Please do not restart the service after the diagnostic test finishes.",
+			"Please restart the service after the diagnostic test finishes.",
+		)
+
+	def test_rejects_modal_change(self):
+		self.assertRejected(
+			"You could archive the task after all the validation steps pass.",
+			"You should archive the task after all the validation steps pass.",
+		)
+
+	def test_short_utterance_allows_only_case_and_punctuation(self):
+		self.assertAccepted("do some research", "Do some research.")
+		self.assertRejected("do some research", "do more research")
+
+	def test_contraction_expansion_preserves_markers(self):
+		self.assertAccepted("I'll do this now.", "I will do this now.")
+
+	def test_moderate_allows_small_proper_noun_fix_in_longer_text(self):
+		self.assertAccepted(
+			"Please use tensor flow in this long machine learning project today.",
+			"Please use TensorFlow in this long machine learning project today.",
+		)
+
+	def test_light_rejects_replacement_even_when_length_matches(self):
+		self.assertRejected(
+			"Please research the documented problem in the current program today.",
+			"Please investigate the documented problem in the current program today.",
+			mode="light",
+		)
 
 
 class StripThinkingTagsTests(unittest.TestCase):
@@ -144,6 +230,15 @@ class IsHallucinationTests(unittest.TestCase):
 
 
 class ConfigManagerTests(unittest.TestCase):
+	def test_fast_defaults_avoid_optional_second_requests(self):
+		self.assertIn('default="raw"', config_manager.CONFSPEC["cleanupMode"])
+		self.assertIn("default=false", config_manager.CONFSPEC["autoRetryEnabled"])
+
+	def test_accuracy_first_transcription_defaults(self):
+		self.assertIn('default="whisper-large-v3"', config_manager.CONFSPEC["transcriptionModel"])
+		self.assertIn("default=3", config_manager.CONFSPEC["activePromptSlot"])
+		self.assertEqual(config_manager.DEFAULT_PROMPT_SLOTS[3], "")
+
 	def test_update_base_profile_updates_live_and_base_profile(self):
 		live_section = {}
 		base_section = {}
@@ -203,14 +298,11 @@ class CleanupPromptRulesTests(unittest.TestCase):
 		self.assertIn("PRESERVE OPENING WORDS", content)
 		self.assertIn("every sentence", content.lower())
 
-	def test_moderate_forbids_pronoun_changes_for_clarity(self):
-		"""Moderate does NOT change pronouns for "clarity" or "consistency"
-		— the only allowed pronoun change is an ASR mishearing with
-		unambiguous context.
-		"""
+	def test_moderate_forbids_all_pronoun_changes(self):
 		messages = build_cleanup_messages("anything goes", "moderate")
 		content = messages[0]["content"]
 		self.assertIn("Do NOT change a pronoun", content)
+		self.assertIn("Never change pronouns", content)
 		self.assertIn("clarity", content.lower())
 
 	def test_moderate_forbids_rephrasing(self):
@@ -295,9 +387,8 @@ class CleanupPromptRulesTests(unittest.TestCase):
 		"""
 		content = build_cleanup_messages("anything goes", "moderate")[0]["content"]
 		self.assertIn("ASR mishearings", content)
-		# Specific categories the prompt enumerates
+		# Specific safe categories the prompt enumerates
 		for phrase in (
-			"Pronoun mishears",
 			"Homophones that change meaning",
 			"Compound terms and proper nouns",
 		):
@@ -314,7 +405,7 @@ class CleanupPromptRulesTests(unittest.TestCase):
 		# The "human transcriber" test that gates each fix
 		self.assertIn("human transcriber", content)
 		# Asymmetry rule: false positives worse than false negatives
-		self.assertIn("false-positive fixes", content)
+		self.assertIn("false-positive fixes", content.lower())
 
 	def test_moderate_protects_short_utterances_from_asr_fixes(self):
 		"""The ASR license is suspended for short utterances — too risky
@@ -460,6 +551,14 @@ class CleanupPostBodyTests(unittest.TestCase):
 		body = post_mock.call_args.kwargs["json"]
 		self.assertEqual(body["reasoning_effort"], "medium")
 
+	def test_qwen_36_disables_reasoning_for_fast_cleanup(self):
+		client = self._client()
+		with mock.patch.object(client._session, "post",
+				return_value=self._ok_response()) as post_mock:
+			client.cleanup("raw", "moderate", "qwen/qwen3.6-27b")
+		body = post_mock.call_args.kwargs["json"]
+		self.assertEqual(body["reasoning_effort"], "none")
+
 	def test_non_gpt_oss_models_skip_reasoning_effort(self):
 		"""reasoning_effort is only honored by gpt-oss models. Sending
 		it to Llama or Qwen would be a no-op at best and a warning
@@ -501,6 +600,27 @@ class CleanupPostBodyTests(unittest.TestCase):
 			client.cleanup("raw", "moderate", "openai/gpt-oss-20b")
 		body = post_mock.call_args.kwargs["json"]
 		self.assertEqual(body["include_reasoning"], False)
+
+	def test_cleanup_temperature_is_deterministic(self):
+		client = self._client()
+		with mock.patch.object(client._session, "post",
+				return_value=self._ok_response("Do some research.")) as post_mock:
+			client.cleanup("do some research", "moderate", "openai/gpt-oss-20b")
+		self.assertEqual(post_mock.call_args.kwargs["json"]["temperature"], 0.0)
+
+	def test_cleanup_falls_back_to_raw_when_model_changes_intent(self):
+		client = self._client()
+		with mock.patch.object(client._session, "post",
+				return_value=self._ok_response("I should do some research.")):
+			result = client.cleanup("Do some research.", "moderate", "openai/gpt-oss-120b")
+		self.assertEqual(result, "Do some research.")
+
+	def test_cleanup_keeps_safe_punctuation_only_edit(self):
+		client = self._client()
+		with mock.patch.object(client._session, "post",
+				return_value=self._ok_response("Do some research.")):
+			result = client.cleanup("do some research", "moderate", "openai/gpt-oss-120b")
+		self.assertEqual(result, "Do some research.")
 
 	def test_raw_mode_does_not_call_api(self):
 		"""The raw mode is the explicit "no cleanup" branch. We must
@@ -583,13 +703,20 @@ class GeminiCleanupPostBodyTests(unittest.TestCase):
 		self.assertIn("maxOutputTokens", body["generationConfig"])
 		self.assertGreater(body["generationConfig"]["maxOutputTokens"], 0)
 
-	def test_gemini_cleanup_uses_same_temperature(self):
+	def test_gemini_cleanup_uses_deterministic_temperature(self):
 		client = self._gc.GeminiClient(api_key="test_key")
 		with mock.patch.object(client._session, "post",
 				return_value=self._ok_response()) as post_mock:
 			client.cleanup("raw", "moderate", "gemini-2.5-flash")
 		body = post_mock.call_args.kwargs["json"]
-		self.assertEqual(body["generationConfig"]["temperature"], 0.3)
+		self.assertEqual(body["generationConfig"]["temperature"], 0.0)
+
+	def test_gemini_cleanup_falls_back_to_raw_when_model_changes_intent(self):
+		client = self._gc.GeminiClient(api_key="test_key")
+		with mock.patch.object(client._session, "post",
+				return_value=self._ok_response("I should do some research.")):
+			result = client.cleanup("Do some research.", "moderate", "gemini-2.5-flash")
+		self.assertEqual(result, "Do some research.")
 
 
 class CleanupDialogRegressionTests(unittest.TestCase):
@@ -687,9 +814,9 @@ class LooksSuspiciousTests(unittest.TestCase):
 
 
 class FilterHallucinatedSegmentsCompressionRatioTests(unittest.TestCase):
-	"""The new compression-ratio filter must catch repetition loops."""
+	"""Diagnostics must not erase plausible literal speech."""
 
-	def test_high_compression_ratio_is_dropped(self):
+	def test_high_compression_ratio_is_kept(self):
 		segments = [
 			{
 				"text": "the the the the the the the the",
@@ -699,9 +826,9 @@ class FilterHallucinatedSegmentsCompressionRatioTests(unittest.TestCase):
 			},
 		]
 		kept = _filter_hallucinated_segments(segments)
-		self.assertEqual(kept, [])
+		self.assertEqual(kept, ["the the the the the the the the"])
 
-	def test_borderline_compression_with_low_logprob_is_dropped(self):
+	def test_borderline_compression_with_low_logprob_is_kept_without_silence_signal(self):
 		segments = [
 			{
 				"text": "I think I think I think",
@@ -711,7 +838,25 @@ class FilterHallucinatedSegmentsCompressionRatioTests(unittest.TestCase):
 			},
 		]
 		kept = _filter_hallucinated_segments(segments)
-		self.assertEqual(kept, [])
+		self.assertEqual(kept, ["I think I think I think"])
+
+	def test_combined_high_no_speech_and_low_confidence_is_dropped(self):
+		segments = [{
+			"text": "Thanks for watching",
+			"no_speech_prob": 0.8,
+			"avg_logprob": -1.2,
+			"compression_ratio": 1.1,
+		}]
+		self.assertEqual(_filter_hallucinated_segments(segments), [])
+
+	def test_high_no_speech_but_confident_words_are_kept(self):
+		segments = [{
+			"text": "Thank you",
+			"no_speech_prob": 0.8,
+			"avg_logprob": -0.2,
+			"compression_ratio": 1.1,
+		}]
+		self.assertEqual(_filter_hallucinated_segments(segments), ["Thank you"])
 
 	def test_borderline_compression_with_high_logprob_is_kept(self):
 		# Legitimate repetitive phrasing with high confidence is
@@ -840,6 +985,16 @@ class TranscribeWithRetryTests(unittest.TestCase):
 		self.assertEqual(result, "So.")
 		self.assertEqual(post_mock.call_count, 1)
 
+	def test_empty_prompt_never_retries_an_identical_request(self):
+		client = self._client()
+		with mock.patch.object(client._session, "post",
+				return_value=self._ok_response("So.")) as post_mock:
+			result = client.transcribe_with_retry(
+				self.wav_path, "whisper-large-v3", prompt="", auto_retry=True,
+			)
+		self.assertEqual(result, "So.")
+		self.assertEqual(post_mock.call_count, 1)
+
 	def test_retry_also_suspicious_returns_longer_one(self):
 		# Both passes are bad; we return whichever has more words
 		# rather than always preferring the first.
@@ -901,7 +1056,7 @@ class GetAudioProcessingTests(unittest.TestCase):
 		self.assertEqual(cfg["preRollMs"], 0)
 		self.assertEqual(cfg["preTrimSilenceMs"], 300)
 		self.assertEqual(cfg["trailingTrimSilenceMs"], 300)
-		self.assertTrue(cfg["autoRetryEnabled"])
+		self.assertFalse(cfg["autoRetryEnabled"])
 
 	def test_returns_overrides_when_set(self):
 		from config_manager import get_audio_processing
@@ -940,22 +1095,22 @@ class GetAudioProcessingTests(unittest.TestCase):
 
 class GeminiModeratePromptParityTests(unittest.TestCase):
 	"""The Gemini cleanup prompt must match the Groq cleanup prompt's
-	ASR-mishearing license in shape and content. If one is updated the
+	conservative ASR-fix rules in shape and content. If one is updated the
 	other should be too — these tests pin the parity.
 	"""
 
 	def _moderate(self) -> str:
 		return gemini_client._gemini_cleanup_system_prompt("moderate")
 
-	def test_gemini_moderate_licenses_asr_mishearing_fixes(self):
+	def test_gemini_moderate_allows_only_non_pronoun_asr_fixes(self):
 		content = self._moderate()
 		self.assertIn("ASR mishearings", content)
 		for phrase in (
-			"Pronoun mishears",
 			"Homophones that change meaning",
 			"Compound terms and proper nouns",
 		):
 			self.assertIn(phrase, content, msg=f"gemini moderate missing {phrase!r}")
+		self.assertIn("Never change pronouns", content)
 
 	def test_gemini_moderate_examples_match_groq(self):
 		"""The same concrete examples should appear in both prompts so

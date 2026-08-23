@@ -132,6 +132,38 @@ class _FakePyAudio:
 		self._recorder_ref = recorder
 
 
+class StaleMicrophoneIndexTests(unittest.TestCase):
+	def test_out_of_range_saved_device_skips_open_and_uses_default(self):
+		"""A stale device index must never reach PortAudio's open call."""
+		class Stream:
+			def read(self, _size, exception_on_overflow=False):
+				recorder._reader_stop.set()
+				return b""
+			def stop_stream(self):
+				pass
+			def close(self):
+				pass
+
+		class Pa:
+			def __init__(self):
+				self.open_calls = []
+			def get_device_count(self):
+				return 2
+			def open(self, **kwargs):
+				self.open_calls.append(kwargs)
+				return Stream()
+
+		pa = Pa()
+		recorder = AudioRecorder(input_device_index=25, silence_enabled=False)
+		# This regression targets the legacy PortAudio fallback. The default
+		# Windows-native backend intentionally bypasses PyAudio altogether.
+		with mock.patch("audio_recorder._soundcard", None), mock.patch("audio_recorder._get_pyaudio", return_value=pa):
+			recorder.start()
+		self.assertEqual(len(pa.open_calls), 1)
+		self.assertIsNone(pa.open_calls[0]["input_device_index"])
+		recorder.stop()
+
+
 class AudioRecorderPreRollTests(unittest.TestCase):
 	"""Exercises the pre-roll state machine without a real PyAudio."""
 
@@ -388,6 +420,17 @@ class AudioRecorderHasSpeechTests(unittest.TestCase):
 		rec._pre_roll_frames = [_silence_bytes(1600)]
 		rec._frames = [_silence_bytes(1600)]
 		self.assertFalse(rec.has_speech())
+
+	def test_callback_caches_speech_floor_for_constant_time_stop(self):
+		rec = AudioRecorder(silence_enabled=False)
+		rec._recording = True
+		rec._callback(_tone_bytes(1024, 8000), 1024, None, None)
+		self.assertTrue(rec._audio_seen)
+		self.assertTrue(rec._speech_floor_detected)
+		# Once callback audio has been observed, has_speech should use the
+		# cached boolean rather than joining and rescanning every frame.
+		with mock.patch("audio_recorder.calculate_peak_level", side_effect=AssertionError("rescanned")):
+			self.assertTrue(rec.has_speech())
 
 
 class CalculateLeadInSilenceTests(unittest.TestCase):

@@ -17,6 +17,10 @@
 <h2>Settings</h2>
 <p>Open NVDA Settings and choose <strong>Groq Voice Dictation</strong> to configure your Groq API key, default microphone, cleanup mode, silence detection, feedback, and paste fallback.</p>
 <p>The settings panel includes a <strong>Get API key</strong> button that first shows setup instructions in a standard dialog and then opens the Groq keys page. Use NVDA's installed add-ons dialog for the add-on documentation/help entry.</p>
+<h2>Accuracy and response time</h2>
+<p>The default recognizer is Whisper Large V3, Groq's recommended model for error-sensitive transcription. Whisper Large V3 Turbo remains available when lower cost and slightly lower latency matter more than the lowest word-error rate. Selecting the spoken language avoids language-detection mistakes.</p>
+<p>New configurations start with an empty Whisper prompt because a prompt biases the recognizer; select a focused glossary slot only when its terms match the current dictation. Raw transcript mode makes one model request. AI cleanup uses deterministic generation and rejects a result that changes the opening, pronouns, negation, modality, certainty, or too many lexical words, falling back to Whisper's raw text instead of guessing missing speech.</p>
+<p>The add-on trims silence from the uploaded WAV and opens the Groq connection while recording, so connection setup is normally complete before you stop speaking.</p>
 <h2>Notes</h2>
 <ul>
 <li>The add-on does not ship with an API key.</li>

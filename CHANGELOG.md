@@ -1,5 +1,30 @@
 # Changelog
 
+## Unreleased
+
+### Accuracy
+- **Cleanup can no longer silently change the speaker's intent.** Groq and Gemini cleanup now run at temperature 0 and pass through a deterministic fidelity gate. If cleanup changes the opening word, grammatical person or pronouns, negation, modal force (`can`, `should`, `must`, and similar words), certainty, conditionals, or too many lexical words, the add-on rejects it and inserts the raw Whisper transcript. Short utterances under eight words allow only capitalization and punctuation changes. This directly prevents `Do some research` from becoming `I should do some research`.
+- **Spoken words are no longer removed on a single suspicious diagnostic.** Segment filtering now follows Whisper's documented conjunction: a segment is treated as silence only when `no_speech_prob` is high and `avg_logprob` is low. High compression ratio is logged rather than used to erase speech, because Groq has already performed Whisper's decode fallback. A physically spoken phrase such as `thank you` is no longer discarded merely because it appears on a generic hallucination list.
+- **Accuracy-first transcription defaults.** New configurations default to full `whisper-large-v3`, which Groq recommends for error-sensitive work, while Turbo remains available. The default active prompt slot is empty so an unrelated glossary cannot bias general dictation; focused vocabulary prompts remain available when relevant.
+- Automatic prompt-free retry now skips the second request when the active prompt is already empty, because it would be an identical temperature-0 transcription rather than independent evidence.
+
+### Performance
+- **Network setup is hidden behind recording.** Starting dictation now pre-warms Groq's authenticated HTTPS connection on a background thread. Groq clients share a thread-safe connection pool across consecutive dictations, and a Groq cleanup request reuses the transcription client's session. This removes repeat DNS/TCP/TLS setup from the stop-to-insert critical path while keeping force-cancel workers isolated.
+- **The default fast path makes one model request.** New/default configurations use raw Whisper output (which already includes punctuation) and leave suspicious-result auto-retry off. AI cleanup and retry remain opt-in for users who prefer the quality tradeoff. Existing explicitly saved settings are preserved.
+- **Cleanup prompts are 74-79% shorter.** Light/moderate/heavy system prompts fell from 449/942/506 words to 112/196/129 words while retaining opening-word, meaning, short-utterance, hallucination, and prompt-injection safeguards. This reduces request bytes and time to first token. Qwen 3.6 cleanup explicitly uses its non-thinking mode; GPT-OSS retains low reasoning effort.
+- **Stopping and insertion do less foreground work.** Microphone callbacks cache whether speech occurred, avoiding an entire-recording rescan when Stop is pressed. Unicode insertion uses 256-character batches with no fixed inter-batch sleeps, and paste fallback no longer waits 50 ms after NVDA's synchronous clipboard write.
+- **Failure response is faster.** Groq now uses separate connect/read timeouts, failing connection establishment after 5 seconds instead of leaving every failure mode under a single 60-second timeout. Client and server request timings are logged for future latency analysis.
+
+### Changed
+- Added `qwen/qwen3.6-27b` to cleanup choices and removed `qwen/qwen3-32b` and `meta-llama/llama-4-scout-17b-16e-instruct`, which Groq will shut down on July 17, 2026.
+
+### Fixed
+- **Last dictation stayed on the clipboard after a paste-fallback insertion.** `TextInserter._paste_text` took the "backup" of the user's clipboard by calling `api.getClipData()` *after* `api.copyToClip(text)` had already overwritten the clipboard. The "backup" was therefore the dictation text itself, and the deferred `_restore_clipboard` put the dictation text back on the clipboard after the paste, instead of restoring the user's original content. Fixed by taking the backup BEFORE the copy. Symptom: a user who had typed or copied something to the clipboard, then used the add-on (which fell back to paste), would find the dictation text sitting on the clipboard indefinitely — appearing to come from nowhere if paste fallback had since been turned off in Debugging settings.
+
+### Tests
+- Added cleanup-fidelity regression coverage for command/statement changes, pronouns, negation, modals, short utterances, contraction expansion, proper-noun repair, Groq/Gemini raw fallback, conservative segment filtering, deterministic cleanup temperature, accuracy-first defaults, and no-op retry suppression.
+- New `tests/test_text_inserter.py` with 13 unit tests pinning the clipboard-order contract (`getClipData` must be called before `copyToClip`; the restore must receive the user's original clipboard content, not the dictation text) and the `insert()` routing (typing-first with paste as fallback, paste disabled in console when fallback is off, clipboard untouched when paste fallback is disabled and typing succeeds or fails).
+
 ## v0.7.1 (2026-07-06)
 
 ### Changed

@@ -175,7 +175,7 @@ class TranscriptionDialog(wx.Dialog):
 		sel = self.transcription_model.GetSelection()
 		if 0 <= sel < len(config_manager.TRANSCRIPTION_MODELS):
 			return config_manager.TRANSCRIPTION_MODELS[sel]
-		return "whisper-large-v3-turbo"
+		return "whisper-large-v3"
 
 	@property
 	def language(self) -> str:
@@ -424,7 +424,8 @@ class AudioDialog(wx.Dialog):
 			"Retries without the prompt when the first pass returns "
 			"a short result starting with a common opener. Recovers "
 			"from the 'prompt-induced start-skipping' failure mode. "
-			"Off skips the second API call but loses that recovery."
+			"Leave off for lowest latency; enabling it can double the "
+			"transcription time for a flagged result."
 		))).Wrap(440)
 
 		helper.addItem(wx.Button(panel, wx.ID_OK, label=_("OK")))
@@ -476,6 +477,11 @@ class CleanupDialog(wx.Dialog):
 		self.cleanup_mode.SetSelection(
 			config_manager.index_for_value(config_manager.CLEANUP_MODES, mode)
 		)
+		latency_note = helper.addItem(wx.StaticText(panel, label=_(
+			"Raw transcript is fastest because it inserts Whisper's already-"
+			"punctuated result immediately. Other modes make a second model request."
+		)))
+		latency_note.Wrap(440)
 
 		self._model_values, self._model_display = self._build_model_choices(gemini_key)
 		self.cleanup_model = helper.addLabeledControl(
@@ -485,7 +491,10 @@ class CleanupDialog(wx.Dialog):
 		self._set_model_selection(model)
 
 		self._llama_warning = helper.addItem(
-			wx.StaticText(panel, label=_("Note: Llama models are deprecated and may be removed from Groq in the near future."))
+			wx.StaticText(panel, label=_(
+				"Note: Groq will retire these Llama cleanup models on August 16, 2026. "
+				"Use GPT-OSS for a supported, faster replacement."
+			))
 		)
 		self._llama_warning.SetForegroundColour(wx.Colour(180, 80, 0))
 

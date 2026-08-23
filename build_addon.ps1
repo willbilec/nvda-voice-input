@@ -35,6 +35,31 @@ if (Test-Path $output) {
 if (Test-Path $zipOutput) {
 	Remove-Item -Force $zipOutput
 }
-Compress-Archive -Path (Join-Path $staging "*") -DestinationPath $zipOutput
+# Compress-Archive intermittently fails on large vendored dependency trees with
+# spurious "file is being used by another process" errors, often naming a
+# different untouched NumPy source file on each attempt. ZipFile traverses the
+# staging directory in one pass without that PowerShell.Archive failure mode.
+# Add each entry explicitly so its ZIP name uses forward slashes; the ZIP spec
+# and NVDA's package loader expect '/' even when the build runs on Windows.
+Add-Type -AssemblyName System.IO.Compression
+Add-Type -AssemblyName System.IO.Compression.FileSystem
+$archive = [System.IO.Compression.ZipFile]::Open(
+	$zipOutput,
+	[System.IO.Compression.ZipArchiveMode]::Create
+)
+try {
+	Get-ChildItem -LiteralPath $staging -Recurse -File | ForEach-Object {
+		$entryName = $_.FullName.Substring($staging.Length + 1).Replace('\', '/')
+		[System.IO.Compression.ZipFileExtensions]::CreateEntryFromFile(
+			$archive,
+			$_.FullName,
+			$entryName,
+			[System.IO.Compression.CompressionLevel]::Optimal
+		) | Out-Null
+	}
+}
+finally {
+	$archive.Dispose()
+}
 Move-Item -Force $zipOutput $output
 Write-Host "Built $output"

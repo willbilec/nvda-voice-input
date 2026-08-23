@@ -9,6 +9,13 @@ import pyaudio
 from logHandler import log
 
 try:
+	# SoundCard talks to Windows Core Audio directly. PyAudio's PortAudio
+	# backend corrupts capture buffers on some Realtek/Intel SST systems.
+	import soundcard as _soundcard
+except ImportError:
+	_soundcard = None
+
+try:
 	from . import audio_processor
 except ImportError:  # pragma: no cover - top-level test import path
 	import audio_processor
@@ -117,6 +124,13 @@ class AudioRecorder:
 		self._trailing_trim_silence_ms = max(0, int(trailing_trim_silence_ms))
 		self._pa = None
 		self._stream = None
+		self._native_microphone = None
+		# Do not use PyAudio's ``stream_callback`` mode.  Its C callback bridge
+		# can terminate the host process when a driver raises an exception (seen
+		# on some Realtek laptop drivers).  A normal blocking read in our own
+		# daemon thread keeps that native callback out of NVDA entirely.
+		self._reader_thread: threading.Thread | None = None
+		self._reader_stop = threading.Event()
 		self._frames: list[bytes] = []
 		self._pre_roll_frames: list[bytes] = []
 		self._pre_rolling = False
@@ -126,6 +140,9 @@ class AudioRecorder:
 		self._silence_notified = False
 		self._recording = False
 		self._speech_detected = False
+		self._speech_floor_detected = False
+		self._audio_seen = False
+		self._reader_stop.clear()
 		self._used_fallback = False
 
 	def start(self) -> None:
@@ -138,6 +155,19 @@ class AudioRecorder:
 		self._silence_duration = 0.0
 		self._silence_notified = False
 		self._speech_detected = False
+		self._speech_floor_detected = False
+		self._audio_seen = False
+		# This recorder can be retried after an unsupported sample rate or
+		# microphone; make sure a previous failed attempt cannot stop its reader.
+		self._reader_stop.clear()
+		if _soundcard is not None:
+			try:
+				self._start_windows_native()
+				return
+			except Exception:
+				# Keep the established PortAudio path for platforms where the
+				# native Windows backend cannot initialize.
+				log.exception("Windows-native microphone backend unavailable; falling back to PortAudio")
 		primary_error = None
 		devices_to_try = [self._input_device_index]
 		fallback = self._fallback_device_index if self._fallback_device_index != self._input_device_index else -2
@@ -147,7 +177,31 @@ class AudioRecorder:
 		pa = None
 		for device_index in devices_to_try:
 			device_error = None
-			for rate in _SAMPLE_RATES:
+			# A device index is only meaningful for the exact device list that
+			# produced it.  Laptop docks, Bluetooth devices, and driver updates
+			# frequently change that list.  Some PortAudio/Realtek combinations
+			# crash the host process when Pa_OpenStream receives an out-of-range
+			# index, rather than returning the expected invalid-device error.
+			# Validate it before any call to ``open`` so a stale NVDA setting can
+			# fall through to the configured/default fallback safely.
+			if device_index >= 0:
+				try:
+					if pa is None:
+						pa = _get_pyaudio()
+					device_count = pa.get_device_count()
+				except Exception as exc:
+					if primary_error is None:
+						primary_error = exc
+					continue
+				if device_index >= device_count:
+					device_error = AudioRecorderError(
+						f"Saved microphone {device_index} is no longer available (only {device_count} devices found)."
+					)
+					log.warning("%s", device_error)
+					if primary_error is None:
+						primary_error = device_error
+					continue
+			for rate in _rates_for_device(pa, device_index):
 				try:
 					if pa is None:
 						pa = _get_pyaudio()
@@ -158,9 +212,7 @@ class AudioRecorder:
 						input=True,
 						input_device_index=None if device_index < 0 else device_index,
 						frames_per_buffer=self.chunk_size,
-						stream_callback=self._callback,
 					)
-					self._stream.start_stream()
 					self._pa = pa
 					self.rate = rate
 					self._input_device_index = device_index
@@ -194,6 +246,12 @@ class AudioRecorder:
 								calculate_lead_in_silence(rate, self.sample_width, self.channels)
 							)
 							self._recording = True
+					self._reader_thread = threading.Thread(
+						target=self._read_audio,
+						name="GroqVoiceDictationAudioReader",
+						daemon=True,
+					)
+					self._reader_thread.start()
 					return
 				except Exception as exc:
 					self._cleanup_stream()
@@ -202,6 +260,49 @@ class AudioRecorder:
 			if primary_error is None:
 				primary_error = device_error
 		raise AudioRecorderError(f"Could not open microphone: {primary_error}") from primary_error
+
+	def _start_windows_native(self) -> None:
+		"""Start capture through Windows Core Audio instead of PortAudio."""
+		microphone = _soundcard.default_microphone()
+		if microphone is None:
+			raise AudioRecorderError("Windows did not report a default microphone.")
+		self._native_microphone = microphone
+		# 44.1 kHz is the native rate of the affected Realtek device and is
+		# accepted by Whisper without resampling.
+		self.rate = 44100
+		if self._pre_roll_ms > 0:
+			self._pre_rolling = True
+			self._pre_roll_timer = threading.Timer(self._pre_roll_ms / 1000.0, self._end_pre_roll)
+			self._pre_roll_timer.daemon = True
+			self._pre_roll_timer.start()
+		else:
+			with self._lock:
+				self._frames.append(calculate_lead_in_silence(self.rate, self.sample_width, self.channels))
+				self._recording = True
+		self._reader_thread = threading.Thread(
+			target=self._read_windows_native,
+			name="GroqVoiceDictationWindowsAudioReader",
+			daemon=True,
+		)
+		self._reader_thread.start()
+		log.info("AudioRecorder started with Windows-native audio (rate=%d, pre_roll=%dms)", self.rate, self._pre_roll_ms)
+
+	def _read_windows_native(self) -> None:
+		"""Capture float samples from Windows Core Audio and convert to PCM."""
+		microphone = self._native_microphone
+		if microphone is None:
+			return
+		try:
+			with microphone.recorder(samplerate=self.rate, channels=1) as recorder:
+				while not self._reader_stop.is_set():
+					samples = recorder.record(numframes=self.chunk_size)
+					# SoundCard returns normalized float samples. Convert directly to
+					# 16-bit little-endian PCM for the existing WAV/transcription path.
+					pcm = (samples[:, 0].clip(-1.0, 1.0) * 32767).astype("<i2").tobytes()
+					self._handle_audio_frame(pcm, self.chunk_size)
+		except Exception as exc:
+			if not self._reader_stop.is_set():
+				log.warning("Windows-native microphone read stopped: %s", exc)
 
 	def _end_pre_roll(self) -> None:
 		"""Promote the pre-roll frames into the main buffer and start recording.
@@ -294,6 +395,7 @@ class AudioRecorder:
 			except Exception:
 				pass
 			self._pre_roll_timer = None
+		self._reader_stop.set()
 		# PortAudio's stop_stream() can hang and raise OSError [Errno -9987]
 		# on some Windows audio drivers (we've seen this on Realtek and USB
 		# devices that fail to drain the capture buffer). Without isolation
@@ -314,6 +416,11 @@ class AudioRecorder:
 		finally:
 			self._stream = None
 			self._pa = None
+			self._native_microphone = None
+			reader = self._reader_thread
+			self._reader_thread = None
+			if reader is not None and reader is not threading.current_thread():
+				reader.join(timeout=1.0)
 		return self._write_temp_wave()
 
 	@property
@@ -322,6 +429,11 @@ class AudioRecorder:
 
 	def has_speech(self) -> bool:
 		with self._lock:
+			# The callback already calculates a peak for silence detection.
+			# Reuse that running result so pressing Stop does not rescan and
+			# concatenate the entire recording on the latency-critical path.
+			if self._audio_seen:
+				return self._speech_floor_detected
 			# During pre-roll the user-facing frames buffer is empty;
 			# we still want to know whether the pre-roll audio
 			# contains any speech so the fallback-microphone logic
@@ -330,6 +442,34 @@ class AudioRecorder:
 		return calculate_peak_level(joined) > _SPEECH_FLOOR
 
 	def _callback(self, in_data, frame_count, _time_info, _status):
+		"""Compatibility entry point for tests and older integrations."""
+		self._handle_audio_frame(in_data, frame_count)
+		return (None, pyaudio.paContinue)
+
+	def _read_audio(self) -> None:
+		"""Read microphone frames without PyAudio's native callback bridge."""
+		while not self._reader_stop.is_set():
+			stream = self._stream
+			if stream is None:
+				return
+			read_started = time.monotonic()
+			try:
+				in_data = stream.read(self.chunk_size, exception_on_overflow=False)
+			except Exception as exc:
+				if not self._reader_stop.is_set():
+					log.warning("Microphone read stopped: %s", exc)
+				return
+			self._handle_audio_frame(in_data, self.chunk_size)
+			# Well-behaved PortAudio streams block for one buffer duration.
+			# This Realtek DirectSound driver instead returns immediately, which
+			# otherwise creates a tight Python loop that starves NVDA's UI thread.
+			# Pace reads to the amount of audio represented by each buffer.
+			remaining = (self.chunk_size / float(self.rate)) - (time.monotonic() - read_started)
+			if remaining > 0:
+				self._reader_stop.wait(remaining)
+
+	def _handle_audio_frame(self, in_data, frame_count) -> None:
+		peak = calculate_peak_level(in_data)
 		with self._lock:
 			if self._pre_rolling:
 				# Capture into the pre-roll buffer only. Silence detection
@@ -339,9 +479,11 @@ class AudioRecorder:
 				self._pre_roll_frames.append(in_data)
 			else:
 				self._frames.append(in_data)
+			self._audio_seen = True
+			if peak > _SPEECH_FLOOR:
+				self._speech_floor_detected = True
 		if self._silence_enabled and self._recording:
 			duration = frame_count / float(self.rate)
-			peak = calculate_peak_level(in_data)
 			if peak <= self._silence_threshold:
 				self._silence_duration += duration
 			else:
@@ -356,7 +498,6 @@ class AudioRecorder:
 			):
 				self._silence_notified = True
 				threading.Thread(target=self._on_silence, daemon=True).start()
-		return (None, pyaudio.paContinue)
 
 	def _write_temp_wave(self) -> str:
 		with self._lock:
@@ -399,6 +540,7 @@ class AudioRecorder:
 		return temp.name
 
 	def _cleanup_stream(self) -> None:
+		self._reader_stop.set()
 		if self._pre_roll_timer is not None:
 			try:
 				self._pre_roll_timer.cancel()
@@ -410,9 +552,14 @@ class AudioRecorder:
 				self._stream.close()
 		finally:
 			self._stream = None
-		self._pa = None
+			self._pa = None
+			self._native_microphone = None
 		self._recording = False
 		self._pre_rolling = False
+		reader = self._reader_thread
+		self._reader_thread = None
+		if reader is not None and reader is not threading.current_thread():
+			reader.join(timeout=1.0)
 
 	@staticmethod
 	def delete_file(path: str) -> None:
@@ -434,17 +581,19 @@ def list_input_devices() -> list[tuple[int, str]]:
 	pa = pyaudio.PyAudio()
 	try:
 		host_api_priority: dict[int, int] = {}
+		host_api_names: dict[int, str] = {}
 		for i in range(pa.get_host_api_count()):
 			try:
 				info = pa.get_host_api_info_by_index(i)
-				host_api_priority[i] = _host_api_rank(str(info.get("name", "")))
+				host_api_names[i] = str(info.get("name", "Unknown API"))
+				host_api_priority[i] = _host_api_rank(host_api_names[i])
 			except Exception:
 				host_api_priority[i] = 99
 		_SKIP_PREFIXES = (
 			"microsoft sound mapper",
 			"primary sound capture driver",
 		)
-		raw: list[tuple[str, int, str]] = []
+		raw: list[tuple[str, str, int]] = []
 		for index in range(pa.get_device_count()):
 			try:
 				info = pa.get_device_info_by_index(index)
@@ -461,16 +610,16 @@ def list_input_devices() -> list[tuple[int, str]]:
 				continue
 			if name.lower() == "input" or name.lower().startswith("input (@"):
 				continue
-			base = _device_base_name(name)
-			raw.append((base, rank, name, index))
-		best: dict[str, tuple[int, str]] = {}
-		for base, rank, name, index in raw:
-			key = base.lower()
-			if key not in best or rank < best[key][0] or (rank == best[key][0] and len(name) > len(best[key][1])):
-				best[key] = (rank, name, index)
-		result: list[tuple[int, str]] = []
-		for key, (rank, name, index) in best.items():
-			result.append((index, name))
+			api_name = host_api_names.get(api_index, "Unknown API")
+			# Do not collapse identical device names from different host APIs.
+			# On this HP/Realtek driver the WASAPI endpoint is silent while the
+			# DirectSound endpoint of the *same* microphone records normally.
+			# The API label lets the user choose the working route explicitly.
+			raw.append((name, api_name, index))
+		result: list[tuple[int, str]] = [
+			(index, f"{name} [{api_name}]")
+			for name, api_name, index in raw
+		]
 		result.sort(key=lambda e: e[1].lower())
 		return result
 	finally:
@@ -493,3 +642,25 @@ def _host_api_rank(name: str) -> int:
 	if "mme" in lower:
 		return 99
 	return 99
+
+
+def _rates_for_device(pa, device_index: int) -> tuple[int, ...]:
+	"""Try a microphone's native rate before conversion rates.
+
+	Some Realtek DirectSound drivers return alternating silent/corrupt blocks
+	when asked to convert their native 44.1 kHz stream to 16 kHz. Whisper
+	accepts standard WAV sample rates, so recording at the device's native rate
+	is safer and preserves the fallback list for devices that reject it.
+	"""
+	try:
+		info = (
+			pa.get_default_input_device_info()
+			if device_index < 0
+			else pa.get_device_info_by_index(device_index)
+		)
+		native_rate = int(round(float(info.get("defaultSampleRate", 0))))
+	except Exception:
+		native_rate = 0
+	if native_rate > 0:
+		return (native_rate,) + tuple(rate for rate in _SAMPLE_RATES if rate != native_rate)
+	return _SAMPLE_RATES

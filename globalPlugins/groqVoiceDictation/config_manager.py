@@ -10,8 +10,8 @@ TRANSCRIPTION_PROVIDERS = [
 ]
 
 TRANSCRIPTION_MODELS = [
-	"whisper-large-v3-turbo",
 	"whisper-large-v3",
+	"whisper-large-v3-turbo",
 ]
 
 GEMINI_CLEANUP_MODELS = [
@@ -46,10 +46,9 @@ LANGUAGE_CHOICES = [
 CLEANUP_MODELS = [
 	"openai/gpt-oss-20b",
 	"openai/gpt-oss-120b",
+	"qwen/qwen3.6-27b",
 	"llama-3.1-8b-instant",
 	"llama-3.3-70b-versatile",
-	"meta-llama/llama-4-scout-17b-16e-instruct",
-	"qwen/qwen3-32b",
 ]
 
 LLAMA_MODELS: set[str] = {
@@ -59,7 +58,7 @@ LLAMA_MODELS: set[str] = {
 }
 
 CLEANUP_MODES = [
-	("raw", "Raw transcript"),
+	("raw", "Raw transcript (fastest; one API request)"),
 	("light", "Light cleanup"),
 	("moderate", "Moderate cleanup"),
 	("heavy", "Heavy rewrite"),
@@ -108,12 +107,20 @@ DEFAULT_PROMPT_SLOTS_JSON = _json.dumps(DEFAULT_PROMPT_SLOTS, ensure_ascii=False
 CONFSPEC = {
 	"apiKey": 'string(default="")',
 	"transcriptionProvider": 'string(default="groq")',
-	"transcriptionModel": 'string(default="whisper-large-v3-turbo")',
+	# Groq recommends the full model for error-sensitive transcription. Turbo
+	# remains available when latency/cost matters more than the lowest WER.
+	"transcriptionModel": 'string(default="whisper-large-v3")',
 	"transcriptionLanguage": 'string(default="en")',
 	"geminiApiKey": 'string(default="")',
 	"promptSlots": f'string(default=\'{DEFAULT_PROMPT_SLOTS_JSON}\')',
-	"activePromptSlot": "integer(default=0,min=0,max=9)",
-	"cleanupMode": 'string(default="light")',
+	# Start with an empty slot. A Whisper prompt is a vocabulary/context bias,
+	# not an instruction, and an unrelated default glossary can bias ordinary
+	# dictation. Users can select a focused glossary when its terms are relevant.
+	"activePromptSlot": "integer(default=3,min=0,max=9)",
+	# Whisper already returns punctuated text. Raw mode avoids a second
+	# network/model round trip and is therefore the responsive default;
+	# model cleanup remains available when rewriting quality is preferred.
+	"cleanupMode": 'string(default="raw")',
 	"cleanupModel": 'string(default="openai/gpt-oss-20b")',
 	# Reasoning effort for gpt-oss cleanup models. Default "low" — the
 	# cleanup prompt is fully rule-bound (Punctuation + ASR fix license
@@ -148,10 +155,10 @@ CONFSPEC = {
 	"trailingTrimSilenceMs": "integer(default=300,min=0,max=2000)",
 	# Auto-retry: when the first transcription pass looks
 	# suspicious (short result, suspect opener word) the add-on
-	# silently retries without the prompt. Off would skip the
-	# second API call, but the prompt-induced start-skipping
-	# workaround is high-value, so it defaults on.
-	"autoRetryEnabled": "boolean(default=true)",
+	# silently retries without the prompt. The prompt-induced start-skipping
+	# workaround remains available, but it can double end-to-end latency
+	# for legitimate short utterances. Keep it opt-in on the fast path.
+	"autoRetryEnabled": "boolean(default=false)",
 }
 
 
@@ -199,7 +206,7 @@ def load_prompt_slots(conf: dict | config.AggregatedSection) -> list[str]:
 
 def get_active_prompt(conf: dict | config.AggregatedSection) -> str:
 	slots = load_prompt_slots(conf)
-	index = conf.get("activePromptSlot", 0) if isinstance(conf, dict) else int(conf.get("activePromptSlot", 0))
+	index = conf.get("activePromptSlot", 3) if isinstance(conf, dict) else int(conf.get("activePromptSlot", 3))
 	if 0 <= index < len(slots):
 		return slots[index]
 	return ""
@@ -222,5 +229,5 @@ def get_audio_processing(conf: dict | config.AggregatedSection) -> dict:
 		"preRollMs": int(_get("preRollMs", 0)),
 		"preTrimSilenceMs": int(_get("preTrimSilenceMs", 300)),
 		"trailingTrimSilenceMs": int(_get("trailingTrimSilenceMs", 300)),
-		"autoRetryEnabled": bool(_get("autoRetryEnabled", True)),
+		"autoRetryEnabled": bool(_get("autoRetryEnabled", False)),
 	}
