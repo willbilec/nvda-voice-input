@@ -6,6 +6,8 @@ Pure functions that operate on raw int16 PCM frame bytes to:
   locate speech in a recorded WAV),
 * trim leading and trailing silence while keeping a small padding on each
   side so Whisper still has acoustic context, and
+* shorten unusually long internal pauses without removing them, keeping
+  dictation out of Whisper's failure-prone long silent windows, and
 * compute RMS for noise-floor estimation.
 
 The recorder writes a WAV that already includes a fixed lead-in silence;
@@ -176,6 +178,73 @@ def trim_silence(
 		return b""
 
 	return samples[start:end].tobytes()
+
+
+def compact_long_silences(
+	frames: FramesLike,
+	rate: int,
+	threshold: int,
+	min_silence_ms: int = 2000,
+	keep_silence_ms: int = 500,
+	sample_width: int = 2,
+) -> bytes:
+	"""Shorten long internal silence runs while preserving a natural pause.
+
+	Whisper decodes long audio in 30-second windows and conditions later windows
+	on earlier text. Long stretches of silence can therefore make a later window
+	hallucinate or repeat text even though the recording contains valid speech
+	after the pause. Dictation does not need the wall-clock duration of a pause,
+	so runs of at least ``min_silence_ms`` are shortened to ``keep_silence_ms``.
+
+	Silence is classified in 20 ms windows using the same peak threshold as the
+	recorder. Short pauses are returned byte-for-byte. For a long pause, half of
+	the retained audio comes from each edge so the acoustic context immediately
+	before and after speech is preserved.
+	"""
+	if rate <= 0:
+		raise ValueError(f"rate must be positive (got {rate})")
+	if min_silence_ms <= 0:
+		raise ValueError(f"min_silence_ms must be positive (got {min_silence_ms})")
+	if keep_silence_ms < 0:
+		raise ValueError(f"keep_silence_ms must not be negative (got {keep_silence_ms})")
+	if keep_silence_ms >= min_silence_ms:
+		return _join_frames(frames)
+
+	samples = _to_samples(frames, sample_width=sample_width)
+	if not samples:
+		return b""
+	window_samples = max(1, int(rate * 0.020))
+	minimum_samples = int((min_silence_ms / 1000.0) * rate)
+	keep_samples = int((keep_silence_ms / 1000.0) * rate)
+	result = array.array("h")
+	silent_start: int | None = None
+
+	def flush_silence(end: int) -> None:
+		nonlocal silent_start
+		if silent_start is None:
+			return
+		run_length = end - silent_start
+		if run_length >= minimum_samples and run_length > keep_samples:
+			left_keep = keep_samples // 2
+			right_keep = keep_samples - left_keep
+			result.extend(samples[silent_start:silent_start + left_keep])
+			if right_keep:
+				result.extend(samples[end - right_keep:end])
+		else:
+			result.extend(samples[silent_start:end])
+		silent_start = None
+
+	for start in range(0, len(samples), window_samples):
+		end = min(len(samples), start + window_samples)
+		is_silent = all(abs(sample) <= threshold for sample in samples[start:end])
+		if is_silent:
+			if silent_start is None:
+				silent_start = start
+			continue
+		flush_silence(start)
+		result.extend(samples[start:end])
+	flush_silence(len(samples))
+	return result.tobytes()
 
 
 def estimate_noise_floor(

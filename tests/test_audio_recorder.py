@@ -29,6 +29,7 @@ if "logHandler" not in sys.modules:
 	))
 
 import audio_processor
+import audio_recorder as audio_recorder_module
 from audio_recorder import (
 	AudioRecorder,
 	AudioRecorderError,
@@ -90,6 +91,63 @@ class AudioRecorderConstructorTests(unittest.TestCase):
 		rec = AudioRecorder(pre_trim_silence_ms=-10, trailing_trim_silence_ms=-20)
 		self.assertEqual(rec.pre_trim_silence_ms, 0)
 		self.assertEqual(rec.trailing_trim_silence_ms, 0)
+
+
+class WindowsNativeMicrophoneResolutionTests(unittest.TestCase):
+	class _Microphone:
+		def __init__(self, name: str) -> None:
+			self.name = name
+
+	class _PyAudio:
+		def __init__(self, selected_name: str, rate: float) -> None:
+			self._info = {"name": selected_name, "defaultSampleRate": rate}
+
+		def get_device_info_by_index(self, _index: int) -> dict:
+			return self._info
+
+		def get_default_input_device_info(self) -> dict:
+			return self._info
+
+	def test_selected_endpoint_and_native_rate_are_preserved(self):
+		selected = self._Microphone("Headset Microphone (SteelSeries)")
+		other = self._Microphone("Webcam Microphone")
+		soundcard = types.SimpleNamespace(
+			all_microphones=lambda: [other, selected],
+			default_microphone=lambda: other,
+		)
+		pa = self._PyAudio("Headset Microphone (SteelSeries)", 48000.0)
+		with mock.patch.object(audio_recorder_module, "_soundcard", soundcard), \
+				mock.patch.object(audio_recorder_module, "_get_pyaudio", return_value=pa):
+			microphone, name, rate = audio_recorder_module._resolve_windows_native_microphone(11)
+		self.assertIs(microphone, selected)
+		self.assertEqual(name, selected.name)
+		self.assertEqual(rate, 48000)
+
+	def test_selected_endpoint_does_not_silently_fall_back_to_default(self):
+		default = self._Microphone("Default Laptop Microphone")
+		soundcard = types.SimpleNamespace(
+			all_microphones=lambda: [default],
+			default_microphone=lambda: default,
+		)
+		pa = self._PyAudio("USB Headset Microphone", 48000.0)
+		with mock.patch.object(audio_recorder_module, "_soundcard", soundcard), \
+				mock.patch.object(audio_recorder_module, "_get_pyaudio", return_value=pa):
+			with self.assertRaises(AudioRecorderError):
+				audio_recorder_module._resolve_windows_native_microphone(11)
+
+	def test_system_default_uses_reported_default_rate(self):
+		default = self._Microphone("Default Headset")
+		soundcard = types.SimpleNamespace(
+			all_microphones=lambda: [default],
+			default_microphone=lambda: default,
+		)
+		pa = self._PyAudio("Default Headset", 44100.0)
+		with mock.patch.object(audio_recorder_module, "_soundcard", soundcard), \
+				mock.patch.object(audio_recorder_module, "_get_pyaudio", return_value=pa):
+			microphone, name, rate = audio_recorder_module._resolve_windows_native_microphone(-1)
+		self.assertIs(microphone, default)
+		self.assertEqual(name, default.name)
+		self.assertEqual(rate, 44100)
 
 
 class _FakeStream:

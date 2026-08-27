@@ -9,6 +9,7 @@ if str(MODULE_DIR) not in sys.path:
 	sys.path.insert(0, str(MODULE_DIR))
 
 from audio_processor import (
+	compact_long_silences,
 	calculate_rms,
 	estimate_noise_floor,
 	find_first_voice_sample,
@@ -233,6 +234,62 @@ class TrimSilenceTests(unittest.TestCase):
 		# 100ms lead + 100ms tone + 1s middle + 100ms tone + 100ms tail
 		# = 1400ms = 22400 samples
 		self.assertEqual(len(result) // 2, 22400)
+
+
+class CompactLongSilencesTests(unittest.TestCase):
+	RATE = 16000
+
+	def test_long_internal_pause_is_shortened_to_half_second(self):
+		first = _tone_bytes(self.RATE, 8000)
+		pause = _silence_bytes(self.RATE * 5)
+		second = _tone_bytes(self.RATE, 6000)
+		result = compact_long_silences(
+			first + pause + second,
+			rate=self.RATE,
+			threshold=200,
+		)
+		self.assertEqual(len(result) // 2, int(self.RATE * 2.5))
+		self.assertEqual(result[:len(first)], first)
+		self.assertEqual(result[-len(second):], second)
+
+	def test_short_pause_is_preserved_byte_for_byte(self):
+		audio = (
+			_tone_bytes(self.RATE, 8000)
+			+ _silence_bytes(int(self.RATE * 1.5))
+			+ _tone_bytes(self.RATE, 6000)
+		)
+		self.assertEqual(
+			compact_long_silences(audio, rate=self.RATE, threshold=200),
+			audio,
+		)
+
+	def test_retains_both_edges_of_a_long_pause(self):
+		quiet_left = _tone_bytes(self.RATE // 4, 100)
+		quiet_right = _tone_bytes(self.RATE // 4, -100)
+		long_pause = quiet_left + _silence_bytes(self.RATE * 3) + quiet_right
+		result = compact_long_silences(
+			long_pause,
+			rate=self.RATE,
+			threshold=200,
+		)
+		self.assertEqual(result, quiet_left + quiet_right)
+
+	def test_keep_at_or_above_minimum_disables_compaction(self):
+		audio = _silence_bytes(self.RATE * 3)
+		self.assertEqual(
+			compact_long_silences(
+				audio,
+				rate=self.RATE,
+				threshold=200,
+				min_silence_ms=2000,
+				keep_silence_ms=2000,
+			),
+			audio,
+		)
+
+	def test_invalid_rate_raises(self):
+		with self.assertRaises(ValueError):
+			compact_long_silences(_silence_bytes(10), rate=0, threshold=200)
 
 
 class EstimateNoiseFloorTests(unittest.TestCase):

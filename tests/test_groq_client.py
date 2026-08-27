@@ -88,10 +88,11 @@ class GroqClientHelpersTests(unittest.TestCase):
 
 	def test_cleanup_prompts_stay_compact(self):
 		# Input tokens directly affect time to first token. Keep every mode
-		# comfortably below the former 449/942/506-word prompts.
+		# below the former 449/942/506-word prompts. Moderate intentionally
+		# carries boundary examples for self-correction classification.
 		for mode in ("light", "moderate", "heavy"):
 			words = build_cleanup_messages("sample", mode)[0]["content"].split()
-			self.assertLess(len(words), 250, msg=f"{mode} prompt regressed to {len(words)} words")
+			self.assertLess(len(words), 400, msg=f"{mode} prompt regressed to {len(words)} words")
 
 	def test_clients_share_https_connection_pool(self):
 		first = GroqClient(api_key="one")
@@ -149,6 +150,63 @@ class CleanupFidelityTests(unittest.TestCase):
 	def test_short_utterance_allows_only_case_and_punctuation(self):
 		self.assertAccepted("do some research", "Do some research.")
 		self.assertRejected("do some research", "do more research")
+
+	def test_moderate_accepts_explicit_i_mean_repair(self):
+		self.assertAccepted(
+			"This is a test of the text-to-speech, I mean, voice-to-text transcription.",
+			"This is a test of the voice-to-text transcription.",
+		)
+
+	def test_moderate_accepts_sorry_and_or_rather_repairs(self):
+		self.assertAccepted(
+			"I need you to open the red file, sorry, the blue file.",
+			"I need you to open the blue file.",
+		)
+		self.assertAccepted(
+			"Schedule it Tuesday, or rather, Thursday.",
+			"Schedule it Thursday.",
+		)
+
+	def test_rejects_deleting_only_the_correction_cue(self):
+		self.assertRejected(
+			"Use text-to-speech, I mean, voice-to-text.",
+			"Use text-to-speech, voice-to-text.",
+		)
+
+	def test_rejects_invented_repair_content(self):
+		self.assertRejected(
+			"Open the red file, sorry, the blue file.",
+			"Open the green file.",
+		)
+
+	def test_local_correction_cannot_delete_the_entire_leading_intent(self):
+		self.assertRejected(
+			"Please send the red file to Sarah, sorry, the blue file.",
+			"The blue file.",
+		)
+
+	def test_explicit_full_restart_can_replace_the_abandoned_sentence(self):
+		self.assertAccepted(
+			"Email the report to Sam, scratch that, archive the report.",
+			"Archive the report.",
+		)
+
+	def test_correction_phrase_at_start_is_not_treated_as_repair(self):
+		self.assertRejected("I mean this sincerely.", "This sincerely.")
+
+	def test_moderate_accepts_bounded_short_grammar_repair(self):
+		self.assertAccepted("Oh, I ment say this.", "I meant to say this.")
+		self.assertAccepted("I went store.", "I went to the store.")
+
+	def test_short_grammar_repair_cannot_add_content_word(self):
+		self.assertRejected("I went store.", "I went to another store.")
+
+	def test_light_mode_does_not_get_moderate_repair_exception(self):
+		self.assertRejected(
+			"Use text-to-speech, I mean, voice-to-text.",
+			"Use voice-to-text.",
+			mode="light",
+		)
 
 	def test_contraction_expansion_preserves_markers(self):
 		self.assertAccepted("I'll do this now.", "I will do this now.")
@@ -407,14 +465,11 @@ class CleanupPromptRulesTests(unittest.TestCase):
 		# Asymmetry rule: false positives worse than false negatives
 		self.assertIn("false-positive fixes", content.lower())
 
-	def test_moderate_protects_short_utterances_from_asr_fixes(self):
-		"""The ASR license is suspended for short utterances — too risky
-		to correct when there's not enough context to confirm.
-		"""
+	def test_moderate_limits_short_utterances_except_explicit_repairs(self):
 		content = build_cleanup_messages("anything goes", "moderate")[0]["content"]
 		self.assertIn("under 8 words", content)
-		# And the prompt must explicitly say NO ASR fix on short utterances
-		self.assertIn("do NOT apply any ASR fix", content)
+		self.assertIn("only fix capitalization and punctuation", content)
+		self.assertIn("unless applying an explicit self-correction", content)
 
 	def test_moderate_caps_asr_fixes_to_prevent_paraphrase_creep(self):
 		"""The prompt must include a numerical cap on ASR fixes to stop
@@ -944,6 +999,23 @@ class TranscribeWithRetryTests(unittest.TestCase):
 		}
 		return resp
 
+	def test_transcribe_prefers_groq_top_level_text_over_filtered_segments(self):
+		client = self._client()
+		response = mock.MagicMock()
+		response.ok = True
+		response.json.return_value = {
+			"text": "Do some research.",
+			"segments": [{
+				"text": "Do some research.",
+				"no_speech_prob": 0.9,
+				"avg_logprob": -1.4,
+				"compression_ratio": 1.1,
+			}],
+		}
+		with mock.patch.object(client._session, "post", return_value=response):
+			result = client.transcribe(self.wav_path, "whisper-large-v3", language="en")
+		self.assertEqual(result, "Do some research.")
+
 	def test_long_first_pass_skips_retry(self):
 		client = self._client()
 		first = "This is a perfectly fine long dictation result"
@@ -985,15 +1057,43 @@ class TranscribeWithRetryTests(unittest.TestCase):
 		self.assertEqual(result, "So.")
 		self.assertEqual(post_mock.call_count, 1)
 
-	def test_empty_prompt_never_retries_an_identical_request(self):
+	def test_empty_prompt_short_result_retries_at_first_fallback_temperature(self):
 		client = self._client()
 		with mock.patch.object(client._session, "post",
-				return_value=self._ok_response("So.")) as post_mock:
+				side_effect=[
+					self._segments_response("Do some research on this.", avg_logprob=-0.6),
+					self._segments_response("Do some research on this.", avg_logprob=-0.1),
+				]) as post_mock:
 			result = client.transcribe_with_retry(
 				self.wav_path, "whisper-large-v3", prompt="", auto_retry=True,
 			)
-		self.assertEqual(result, "So.")
-		self.assertEqual(post_mock.call_count, 1)
+		self.assertEqual(result, "Do some research on this.")
+		self.assertEqual(post_mock.call_count, 2)
+		retry_form = post_mock.call_args_list[1].kwargs["data"]
+		self.assertEqual(retry_form["temperature"], "0.2")
+		self.assertNotIn("prompt", retry_form)
+
+	def test_short_retry_selects_meaningfully_higher_confidence_candidate(self):
+		client = self._client()
+		with mock.patch.object(client._session, "post", side_effect=[
+			self._segments_response("Does that fly like a principle?", avg_logprob=-0.62),
+			self._segments_response("Does that file look printable?", avg_logprob=-0.20),
+		]):
+			result = client.transcribe_with_retry(
+				self.wav_path, "whisper-large-v3", prompt="", auto_retry=True,
+			)
+		self.assertEqual(result, "Does that file look printable?")
+
+	def test_short_retry_keeps_temperature_zero_result_when_confidence_is_close(self):
+		client = self._client()
+		with mock.patch.object(client._session, "post", side_effect=[
+			self._segments_response("Open the saved file.", avg_logprob=-0.20),
+			self._segments_response("Open a saved file.", avg_logprob=-0.18),
+		]):
+			result = client.transcribe_with_retry(
+				self.wav_path, "whisper-large-v3", prompt="", auto_retry=True,
+			)
+		self.assertEqual(result, "Open the saved file.")
 
 	def test_retry_also_suspicious_returns_longer_one(self):
 		# Both passes are bad; we return whichever has more words
@@ -1133,14 +1233,23 @@ class GeminiModeratePromptParityTests(unittest.TestCase):
 		self.assertIn("paraphrase", content.lower())
 		self.assertIn("rephrase", content.lower())
 
-	def test_gemini_moderate_protects_short_utterances_from_asr_fixes(self):
+	def test_gemini_moderate_defines_self_corrections_and_short_grammar_repairs(self):
 		content = self._moderate()
-		self.assertIn("under 8 words", content)
-		self.assertIn("do NOT apply any ASR fix", content)
+		self.assertIn("SELF-CORRECTIONS", content)
+		self.assertIn("delete BOTH the abandoned wording and the cue", content)
+		self.assertIn("'Oh, I ment say this' -> 'I meant to say this.'", content)
 
-	def test_gemini_moderate_caps_asr_fixes(self):
-		content = self._moderate()
-		self.assertIn("5-10%", content)
+	def test_gemini_and_groq_prompts_share_correction_boundaries(self):
+		gemini_content = self._moderate()
+		groq_content = build_cleanup_messages("anything goes", "moderate")[0]["content"]
+		for example in (
+			"'Use text-to-speech, I mean, voice-to-text.' -> 'Use voice-to-text.'",
+			"'I mean this sincerely.' -> unchanged",
+			"'Actually, I think we should wait.' -> unchanged",
+			"'Oh no, the file is gone.' -> unchanged",
+		):
+			self.assertIn(example, gemini_content)
+			self.assertIn(example, groq_content)
 
 
 if __name__ == "__main__":

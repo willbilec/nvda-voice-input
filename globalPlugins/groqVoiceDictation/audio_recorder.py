@@ -262,14 +262,17 @@ class AudioRecorder:
 		raise AudioRecorderError(f"Could not open microphone: {primary_error}") from primary_error
 
 	def _start_windows_native(self) -> None:
-		"""Start capture through Windows Core Audio instead of PortAudio."""
-		microphone = _soundcard.default_microphone()
+		"""Start capture through Windows Core Audio using the selected endpoint."""
+		microphone, device_name, native_rate = _resolve_windows_native_microphone(
+			self._input_device_index
+		)
 		if microphone is None:
-			raise AudioRecorderError("Windows did not report a default microphone.")
+			raise AudioRecorderError("Windows did not report the selected microphone.")
 		self._native_microphone = microphone
-		# 44.1 kHz is the native rate of the affected Realtek device and is
-		# accepted by Whisper without resampling.
-		self.rate = 44100
+		# Capture at the endpoint's negotiated/default rate. Groq down-samples to
+		# 16 kHz once on the server; forcing 44.1 kHz here can make Windows first
+		# resample a 48 kHz headset, adding an avoidable conversion.
+		self.rate = native_rate
 		if self._pre_roll_ms > 0:
 			self._pre_rolling = True
 			self._pre_roll_timer = threading.Timer(self._pre_roll_ms / 1000.0, self._end_pre_roll)
@@ -285,7 +288,10 @@ class AudioRecorder:
 			daemon=True,
 		)
 		self._reader_thread.start()
-		log.info("AudioRecorder started with Windows-native audio (rate=%d, pre_roll=%dms)", self.rate, self._pre_roll_ms)
+		log.info(
+			"AudioRecorder started with Windows-native audio (device=%r, rate=%d, pre_roll=%dms)",
+			device_name, self.rate, self._pre_roll_ms,
+		)
 
 	def _read_windows_native(self) -> None:
 		"""Capture float samples from Windows Core Audio and convert to PCM."""
@@ -523,11 +529,18 @@ class AudioRecorder:
 			# a missing file. The worker treats an empty file the same
 			# as no-speech and skips the API call.
 			trimmed = b"\x00\x00" * self.rate  # 1s of silence
+		compacted = audio_processor.compact_long_silences(
+			trimmed,
+			rate=self.rate,
+			threshold=self._silence_threshold,
+		)
 		pre_trim_seconds = len(frames) / float(self.rate * self.sample_width * self.channels)
 		post_trim_seconds = len(trimmed) / float(self.rate * self.sample_width * self.channels)
+		post_compact_seconds = len(compacted) / float(self.rate * self.sample_width * self.channels)
 		log.info(
-			"AudioRecorder trim: %.2fs -> %.2fs (threshold=%d, pads=%d/%d ms)",
-			pre_trim_seconds, post_trim_seconds, self._silence_threshold,
+			"AudioRecorder preprocessing: %.2fs -> %.2fs trimmed -> %.2fs compacted "
+			"(threshold=%d, pads=%d/%d ms)",
+			pre_trim_seconds, post_trim_seconds, post_compact_seconds, self._silence_threshold,
 			self._pre_trim_silence_ms, self._trailing_trim_silence_ms,
 		)
 		temp = tempfile.NamedTemporaryFile(delete=False, suffix=".wav")
@@ -536,7 +549,7 @@ class AudioRecorder:
 			wav_file.setnchannels(self.channels)
 			wav_file.setsampwidth(self.sample_width)
 			wav_file.setframerate(self.rate)
-			wav_file.writeframes(trimmed)
+			wav_file.writeframes(compacted)
 		return temp.name
 
 	def _cleanup_stream(self) -> None:
@@ -664,3 +677,62 @@ def _rates_for_device(pa, device_index: int) -> tuple[int, ...]:
 	if native_rate > 0:
 		return (native_rate,) + tuple(rate for rate in _SAMPLE_RATES if rate != native_rate)
 	return _SAMPLE_RATES
+
+
+def _resolve_windows_native_microphone(device_index: int):
+	"""Map the saved PyAudio endpoint to SoundCard and preserve its native rate.
+
+	SoundCard and PyAudio enumerate the same Windows endpoints with different
+	IDs.  The old native path ignored ``device_index`` entirely and always used
+	the system default at a hard-coded 44.1 kHz.  Match by the endpoint name;
+	when no safe match exists, raise so ``start`` uses the established PyAudio
+	path rather than silently recording from the wrong microphone.
+	"""
+	if _soundcard is None:
+		raise AudioRecorderError("Windows-native audio is unavailable.")
+	pa = _get_pyaudio()
+	try:
+		info = (
+			pa.get_default_input_device_info()
+			if device_index < 0
+			else pa.get_device_info_by_index(device_index)
+		)
+	except Exception as exc:
+		raise AudioRecorderError(f"Saved microphone {device_index} is unavailable.") from exc
+	desired_name = str(info.get("name", "")).strip()
+	native_rate = int(round(float(info.get("defaultSampleRate", 0) or 0)))
+	if native_rate <= 0:
+		native_rate = 48000
+
+	if device_index < 0:
+		microphone = _soundcard.default_microphone()
+		if microphone is None:
+			raise AudioRecorderError("Windows did not report a default microphone.")
+		return microphone, str(getattr(microphone, "name", desired_name)), native_rate
+
+	microphones = list(_soundcard.all_microphones())
+	desired_key = _normalize_device_name(desired_name)
+	for microphone in microphones:
+		candidate_name = str(getattr(microphone, "name", "")).strip()
+		if _normalize_device_name(candidate_name) == desired_key:
+			return microphone, candidate_name, native_rate
+	# Some PortAudio host APIs truncate endpoint names. Accept an unambiguous
+	# containment match, but never guess when multiple physical devices match.
+	partial_matches = []
+	for microphone in microphones:
+		candidate_name = str(getattr(microphone, "name", "")).strip()
+		candidate_key = _normalize_device_name(candidate_name)
+		if desired_key and candidate_key and (
+			desired_key in candidate_key or candidate_key in desired_key
+		):
+			partial_matches.append((microphone, candidate_name))
+	if len(partial_matches) == 1:
+		microphone, candidate_name = partial_matches[0]
+		return microphone, candidate_name, native_rate
+	raise AudioRecorderError(
+		f"Selected microphone {desired_name!r} could not be mapped to Windows Core Audio."
+	)
+
+
+def _normalize_device_name(name: str) -> str:
+	return " ".join(name.casefold().split())

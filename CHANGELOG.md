@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+## v0.8.1 (2026-08-27)
+
+### Accuracy
+- **The selected microphone is respected by the Windows-native recorder.** v0.8.0's SoundCard path always opened the system-default microphone at a hard-coded 44.1 kHz, even when the user had selected another endpoint. The native path now maps the saved PyAudio endpoint name to the corresponding Windows Core Audio microphone and captures at that endpoint's reported native rate. If it cannot map the selection unambiguously, it falls back to the established PyAudio path instead of guessing.
+- **Groq's complete transcript is authoritative.** The add-on now returns Groq's documented top-level `text` result and uses verbose segment metadata only for diagnostics. It reconstructs text from segments only if the API unusually omits the top-level result, preventing client-side confidence filtering from deleting words Groq's decoder accepted.
+- **Short dictation gets a genuine alternate decode when auto-retry is enabled.** Results of seven words or fewer are retried at Whisper's first fallback temperature (0.2), even when no vocabulary prompt is active. The add-on changes the text only when Groq's segment diagnostics show meaningfully higher confidence; temperature 0 wins close calls.
+- **Long pauses no longer push Whisper into silent decoding windows.** Internal silence of at least two seconds is shortened to half a second before upload, while speech and natural short pauses remain intact. This preserves manual push-to-toggle dictation with pauses but avoids Whisper's documented long-form repetition/hallucination failure mode. A controlled 62-second reproduction hallucinated words after a 45-second pause; the compacted 17.5-second version transcribed the same speech correctly.
+- **Moderate cleanup now understands explicit self-corrections.** GPT-OSS and Gemini receive structured definitions plus positive and negative boundary examples for cues such as `I mean`, `sorry`, `or rather`, and `scratch that`. The fidelity gate now permits a proven deletion-only repair that retains the corrected wording, as well as at most two safe function-word insertions for obvious broken grammar (`Oh, I ment say this` → `I meant to say this`). It still rejects merely deleting the cue while leaving both alternatives, invented replacement content, broad paraphrasing, and accidental removal of meaningful openers.
+
+### Tests
+- Added regression coverage for selected/default Windows endpoint mapping, native-rate preservation, refusal to guess an unmatched microphone, preservation of Groq's top-level transcript when segment diagnostics look suspicious, confidence-based short-dictation retries, conservative internal-silence compaction, and bounded self-correction cleanup.
+
+## v0.8.0 (2026-08-23)
+
 ### Accuracy
 - **Cleanup can no longer silently change the speaker's intent.** Groq and Gemini cleanup now run at temperature 0 and pass through a deterministic fidelity gate. If cleanup changes the opening word, grammatical person or pronouns, negation, modal force (`can`, `should`, `must`, and similar words), certainty, conditionals, or too many lexical words, the add-on rejects it and inserts the raw Whisper transcript. Short utterances under eight words allow only capitalization and punctuation changes. This directly prevents `Do some research` from becoming `I should do some research`.
 - **Spoken words are no longer removed on a single suspicious diagnostic.** Segment filtering now follows Whisper's documented conjunction: a segment is treated as silence only when `no_speech_prob` is high and `avg_logprob` is low. High compression ratio is logged rather than used to erase speech, because Groq has already performed Whisper's decode fallback. A physically spoken phrase such as `thank you` is no longer discarded merely because it appears on a generic hallucination list.

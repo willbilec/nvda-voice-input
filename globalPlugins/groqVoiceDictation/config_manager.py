@@ -153,11 +153,9 @@ CONFSPEC = {
 	"preRollMs": "integer(default=0,min=0,max=2000)",
 	"preTrimSilenceMs": "integer(default=300,min=0,max=2000)",
 	"trailingTrimSilenceMs": "integer(default=300,min=0,max=2000)",
-	# Auto-retry: when the first transcription pass looks
-	# suspicious (short result, suspect opener word) the add-on
-	# silently retries without the prompt. The prompt-induced start-skipping
-	# workaround remains available, but it can double end-to-end latency
-	# for legitimate short utterances. Keep it opt-in on the fast path.
+	# Auto-retry: short or suspicious first results get an alternate Whisper
+	# decode without the prompt. Segment confidence selects the result. This can
+	# double end-to-end latency for short utterances, so keep it opt-in.
 	"autoRetryEnabled": "boolean(default=false)",
 }
 

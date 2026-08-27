@@ -421,11 +421,11 @@ class AudioDialog(wx.Dialog):
 		)
 		self.auto_retry.SetValue(auto_retry)
 		helper.addItem(wx.StaticText(panel, label=_(
-			"Retries without the prompt when the first pass returns "
-			"a short result starting with a common opener. Recovers "
-			"from the 'prompt-induced start-skipping' failure mode. "
+			"Retries short or suspicious results without the prompt and "
+			"selects a clearly higher-confidence decode. This helps both "
+			"ambiguous short commands and prompt-induced start skipping. "
 			"Leave off for lowest latency; enabling it can double the "
-			"transcription time for a flagged result."
+			"transcription time for short or flagged results."
 		))).Wrap(440)
 
 		helper.addItem(wx.Button(panel, wx.ID_OK, label=_("OK")))
